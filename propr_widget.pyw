@@ -1,5 +1,5 @@
 # Propr Live - mini corner terminal. Only REDUCE-ONLY orders on existing positions + cancels. Never opens positions.
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 import ctypes, sys, json, os, threading, time, urllib.request, webbrowser, datetime, math, tkinter as tk, tkinter.font as tkf
 HERE = os.path.dirname(os.path.abspath(__file__))
 try: C = json.load(open(os.path.join(HERE, "config.json")))
@@ -166,15 +166,18 @@ root = tk.Tk(); root.title("Propr Live"); root.overrideredirect(True)
 root.attributes("-topmost", True); root.attributes("-alpha", 0.95); root.configure(bg=BG, highlightthickness=1, highlightbackground=LINE)
 fams = set(tkf.families()); UI = "Segoe UI Variable Display" if "Segoe UI Variable Display" in fams else "Segoe UI"
 MONO = "Cascadia Mono" if "Cascadia Mono" in fams else "Consolas"
-try: g = json.load(open(os.path.join(HERE, "pos.json"))); root.geometry(f"+{g['x']}+{g['y']}")
-except Exception: root.geometry("+40+40")
 # v3.4 size: every font is a shared named font so +/- rescales the whole UI live
 SET_F = os.path.join(HERE, "settings.json")
 try: S = json.load(open(SET_F))
 except Exception: S = {}
 SC = {"s": min(1.6, max(0.7, float(S.get("scale", 1.0)))), "w": int(S.get("width", 0) or 0), "h": int(S.get("extra_h", 0) or 0)}
+# v3.4.1 position lives in settings.json (pos.json read once for migration)
+POS = {"x": S.get("x"), "y": S.get("y")}
+if POS["x"] is None:
+    try: g = json.load(open(os.path.join(HERE, "pos.json"))); POS = {"x": int(g["x"]), "y": int(g["y"])}
+    except Exception: POS = {"x": None, "y": None}
 def save_set():
-    try: json.dump({"scale": SC["s"], "width": SC["w"], "extra_h": SC["h"]}, open(SET_F, "w"))
+    try: json.dump({"scale": SC["s"], "width": SC["w"], "extra_h": SC["h"], "x": root.winfo_x(), "y": root.winfo_y()}, open(SET_F, "w"))
     except Exception: pass
 _FONTS = {}
 def F(fam, size, *st):
@@ -219,15 +222,46 @@ def rescale(d):
     SC["s"] = ns
     for (fam, size, *st), f in _FONTS.items(): f.configure(size=max(5, round(size * ns)))
     relayout(); save_set(); toast(f"Size {int(ns*100)}%")
-B(hdr, "+", lambda: rescale(0.1), SUB, BG, CARD2, F(UI, 10, "bold")).pack(side="right")
-B(hdr, "-", lambda: rescale(-0.1), SUB, BG, CARD2, F(UI, 10, "bold")).pack(side="right")
+HDR_BTNS = [xb, B(hdr, "+", lambda: rescale(0.1), SUB, BG, CARD2, F(UI, 10, "bold")), B(hdr, "-", lambda: rescale(-0.1), SUB, BG, CARD2, F(UI, 10, "bold"))]
+for b_ in HDR_BTNS[1:]: b_.pack(side="right")
 ago = L(hdr, "", DIM, F(UI, 8), BG); ago.pack(side="right", padx=6)
+# v3.4.1 move: manual drag on the whole header (works without activation), always clamped to the monitor work area
+class PT(ctypes.Structure): _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+def work_area(x, y):
+    """(l, t, r, b) work area (minus taskbar) of the monitor containing point x,y; nearest monitor if off-screen."""
+    if WIN:
+        try:
+            U32.MonitorFromPoint.restype = ctypes.c_void_p; U32.MonitorFromPoint.argtypes = [PT, ctypes.c_uint]
+            mi = MINFO(); mi.cb = ctypes.sizeof(MINFO)
+            if U32.GetMonitorInfoW(U32.MonitorFromPoint(PT(int(x), int(y)), 2), ctypes.byref(mi)):
+                w = mi.work; return w.l, w.t, w.r, w.b
+        except Exception: pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+def clamp(x, y, w, h):
+    l, t, r, b = work_area(x + w // 2, y + min(h, 40) // 2)
+    x = max(l, min(x, r - w)); y = max(t, min(y, b - h)); return x, y
+def place_win(x=None, y=None):
+    """Fit height to the work area (list scrolls instead), then clamp position."""
+    x = root.winfo_x() if x is None else x; y = root.winfo_y() if y is None else y
+    w = WW(); l, t, r, b = work_area(x + w // 2, y + 20)
+    inner_h = inner.winfo_reqheight() + SC["h"]; other = root.winfo_reqheight() - body.winfo_reqheight()
+    ch = max(60, min(inner_h, (b - t) - other)); w = min(w, r - l)
+    if int(body.cget("height")) != ch: body.config(height=ch)
+    h = other + ch; x, y = clamp(x, y, w, h); g = f"{w}x{h}+{x}+{y}"
+    if root.geometry() != g: root.geometry(g)
+    sbar_show(inner_h > ch)
 def ds(e): root._d = (e.x_root - root.winfo_x(), e.y_root - root.winfo_y())
-def dm(e): root.geometry(f"+{e.x_root-root._d[0]}+{e.y_root-root._d[1]}")
-def dr(e):
-    try: json.dump({"x": root.winfo_x(), "y": root.winfo_y()}, open(os.path.join(HERE, "pos.json"), "w"))
-    except Exception: pass
-for w in (hdr, live, ago): w.bind("<Button-1>", ds); w.bind("<B1-Motion>", dm); w.bind("<ButtonRelease-1>", dr)
+def dm(e):
+    if hasattr(root, "_d"): place_win(e.x_root - root._d[0], e.y_root - root._d[1])
+def dr(e): root.__dict__.pop("_d", None); save_set()
+def snap(e=None):   # double-click header: top-right of the current monitor
+    l, t, r, b = work_area(root.winfo_x() + root.winfo_width() // 2, root.winfo_y() + 20)
+    place_win(r - root.winfo_width() - 8, t + 8); save_set(); toast("Position reset")
+def drag_bind(w):
+    w.bind("<Button-1>", ds); w.bind("<B1-Motion>", dm); w.bind("<ButtonRelease-1>", dr); w.bind("<Double-Button-1>", snap)
+    w.config(cursor="fleur")
+for w in hdr.winfo_children() + [hdr]:
+    if w not in HDR_BTNS: drag_bind(w)
 # equity card
 ec = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=CARD); ec.pack(fill="x", padx=8, pady=4)
 r1 = tk.Frame(ec, bg=CARD); r1.pack(fill="x", padx=12, pady=(10, 0))
@@ -239,10 +273,23 @@ bar = tk.Canvas(ec, height=8, bg=CARD, highlightthickness=0); bar.pack(fill="x",
 faill = L(ec, "", SUB, F(UI, 7), justify="left"); faill.pack(anchor="w", padx=12, pady=(0, 2))
 tbar = tk.Canvas(ec, height=8, bg=CARD, highlightthickness=0); tbar.pack(fill="x", padx=12, pady=(4, 2))
 tgl = L(ec, "", SUB, F(UI, 7), justify="left"); tgl.pack(anchor="w", padx=12, pady=(0, 8))
-L(root, "POSITIONS", SUB, F(UI, 8, "bold"), BG).pack(anchor="w", padx=12, pady=(6, 2))
-posf = tk.Frame(root, bg=BG); posf.pack(fill="x", padx=8)
-L(root, "ORDERS", SUB, F(UI, 8, "bold"), BG).pack(anchor="w", padx=12, pady=(8, 2))
-ordf = tk.Frame(root, bg=CARD); ordf.pack(fill="x", padx=8)
+# v3.4.1 positions/orders live in a scrollable area so the window never runs off-screen
+bodyf = tk.Frame(root, bg=BG); bodyf.pack(fill="x")
+body = tk.Canvas(bodyf, bg=BG, highlightthickness=0, height=200); body.pack(side="left", fill="x", expand=True)
+sbar = tk.Scrollbar(bodyf, orient="vertical", command=body.yview, width=10); body.config(yscrollcommand=sbar.set)
+inner = tk.Frame(body, bg=BG); body.create_window((0, 0), window=inner, anchor="nw", tags="in")
+inner.bind("<Configure>", lambda e: body.config(scrollregion=body.bbox("all")))
+body.bind("<Configure>", lambda e: body.itemconfig("in", width=e.width))
+def sbar_show(on):
+    if on and not sbar.winfo_ismapped(): sbar.pack(side="right", fill="y")
+    elif not on and sbar.winfo_ismapped(): sbar.pack_forget(); body.yview_moveto(0)
+def _wheel(e):
+    if sbar.winfo_ismapped(): body.yview_scroll(-1 if e.delta > 0 else 1, "units")
+root.bind_all("<MouseWheel>", _wheel)
+L(inner, "POSITIONS", SUB, F(UI, 8, "bold"), BG).pack(anchor="w", padx=12, pady=(6, 2))
+posf = tk.Frame(inner, bg=BG); posf.pack(fill="x", padx=8)
+L(inner, "ORDERS", SUB, F(UI, 8, "bold"), BG).pack(anchor="w", padx=12, pady=(8, 2))
+ordf = tk.Frame(inner, bg=CARD); ordf.pack(fill="x", padx=8)
 tl = tk.Label(root, font=F(UI, 9, "bold"), wraplength=WW() - 30, justify="left", padx=8, pady=5)
 emerg = B(root, "⚡  EMERGENCY · OPEN TERMINAL", lambda: webbrowser.open(TERM), "white", "#d9304a", "#ff3b55", F(UI, 11, "bold"))
 emerg.config(pady=9); emerg.pack(fill="x", padx=8, pady=(10, 4))
@@ -252,7 +299,7 @@ def relayout():
     w = WW(); tl.config(wraplength=w - 30); faill.config(wraplength=w - 40); tgl.config(wraplength=w - 40)
     rows["sig"] = None   # rebuild rows so they reflow to the new width
     for r in rows["ord"].values(): r["lab"].config(wraplength=w - 60)
-    root.geometry(f"{w}x{root.winfo_reqheight() + SC['h']}")
+    root.update_idletasks(); place_win()
 def rs_start(e): root._r = (e.x_root, e.y_root, root.winfo_width(), SC["h"])
 def rs_move(e, wx, hy):
     x0, y0, w0, h0 = root._r
@@ -265,7 +312,7 @@ for cur, wx, hy, place in (("sb_h_double_arrow", 1, 0, dict(relx=1, x=-5, y=0, w
                             ("bottom_right_corner", 1, 1, dict(relx=1, rely=1, x=-14, y=-14, width=14, height=14))):
     g = tk.Label(root, text="◢" if wx and hy else "", fg=DIM, bg=BG, font=F(UI, 7), cursor=cur)
     g.place(**place); g.bind("<Button-1>", rs_start); g.bind("<B1-Motion>", lambda e, a=wx, b=hy: rs_move(e, a, b)); g.bind("<ButtonRelease-1>", rs_end)
-root.geometry(f"{WW()}x1"); root.update_idletasks(); faill.config(wraplength=WW() - 40); tgl.config(wraplength=WW() - 40)
+root.geometry(f"{WW()}x1+{POS['x'] if POS['x'] is not None else 40}+{POS['y'] if POS['y'] is not None else 40}"); root.update_idletasks(); place_win(); faill.config(wraplength=WW() - 40); tgl.config(wraplength=WW() - 40)
 set_noactivate(root); OWN.add(hwnd_of(root))
 # Typing in SL/TP boxes needs keyboard focus: allow it only after Kenny clicks a box, drop it again on focus-out.
 def _ent_click(e):
@@ -377,8 +424,7 @@ def tick():
                 r["card"].config(highlightbackground=CARD if sl else RED)
             for r in rows["ord"].values():
                 mp = n(D["mids"].get(r["asset"])); r["px"].config(text=r["txt"] + (f"   ·   now ${fpx(mp)}" if mp else ""))
-        g = f"{WW()}x{root.winfo_reqheight() + SC['h']}"
-        if root.geometry().split("+")[0] != g: root.geometry(g)
+        if not hasattr(root, "_d"): place_win()   # keep fitted + on-screen (also after monitor/taskbar changes)
     except Exception: pass
     root.after(500, tick)
 def keep_top():
