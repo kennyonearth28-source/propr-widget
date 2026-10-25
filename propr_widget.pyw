@@ -1,5 +1,5 @@
 # Propr Live - mini corner terminal. Only REDUCE-ONLY orders on existing positions + cancels. Never opens positions.
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 import ctypes, sys, json, os, threading, time, urllib.request, webbrowser, datetime, math, tkinter as tk, tkinter.font as tkf
 HERE = os.path.dirname(os.path.abspath(__file__))
 try: C = json.load(open(os.path.join(HERE, "config.json")))
@@ -168,9 +168,23 @@ fams = set(tkf.families()); UI = "Segoe UI Variable Display" if "Segoe UI Variab
 MONO = "Cascadia Mono" if "Cascadia Mono" in fams else "Consolas"
 try: g = json.load(open(os.path.join(HERE, "pos.json"))); root.geometry(f"+{g['x']}+{g['y']}")
 except Exception: root.geometry("+40+40")
-def L(par, text="", fg=TXT, font=None, bg=CARD, **kw): return tk.Label(par, text=text, fg=fg, bg=bg, font=font or (UI, 9), **kw)
+# v3.4 size: every font is a shared named font so +/- rescales the whole UI live
+SET_F = os.path.join(HERE, "settings.json")
+try: S = json.load(open(SET_F))
+except Exception: S = {}
+SC = {"s": min(1.6, max(0.7, float(S.get("scale", 1.0)))), "w": int(S.get("width", 0) or 0), "h": int(S.get("extra_h", 0) or 0)}
+def save_set():
+    try: json.dump({"scale": SC["s"], "width": SC["w"], "extra_h": SC["h"]}, open(SET_F, "w"))
+    except Exception: pass
+_FONTS = {}
+def F(fam, size, *st):
+    k = (fam, size) + st
+    if k not in _FONTS: _FONTS[k] = tkf.Font(root, family=fam, size=max(5, round(size * SC["s"])), weight="bold" if "bold" in st else "normal")
+    return _FONTS[k]
+def WW(): return SC["w"] or round(W * SC["s"])   # current window width in px
+def L(par, text="", fg=TXT, font=None, bg=CARD, **kw): return tk.Label(par, text=text, fg=fg, bg=bg, font=font or FF(UI, 9), **kw)
 def B(par, text, cmd, fg=TXT, bg=CARD2, hov=LINE, font=None):
-    b = tk.Label(par, text=text, fg=fg, bg=bg, font=font or (UI, 8, "bold"), padx=7, pady=3, cursor="hand2")
+    b = tk.Label(par, text=text, fg=fg, bg=bg, font=font or F(UI, 8, "bold"), padx=7, pady=3, cursor="hand2")
     b.bind("<Enter>", lambda e: b.config(bg=hov)); b.bind("<Leave>", lambda e: b.config(bg=bg)); b.bind("<Button-1>", lambda e: cmd()); return b
 busy = {"on": False}
 def toast(msg, ok=True):
@@ -179,8 +193,8 @@ def toast(msg, ok=True):
 def confirm(title, lines, fn, danger=True):
     if busy["on"]: toast("Another action is running", False); return
     d = tk.Toplevel(root); d.overrideredirect(True); d.attributes("-topmost", True); d.configure(bg=CARD, highlightthickness=2, highlightbackground=RED if danger else BLU)
-    L(d, title, font=(UI, 11, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
-    for ln in lines: L(d, ln, SUB, (MONO, 9), justify="left").pack(anchor="w", padx=14)
+    L(d, title, font=F(UI, 11, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
+    for ln in lines: L(d, ln, SUB, F(MONO, 9), justify="left").pack(anchor="w", padx=14)
     row = tk.Frame(d, bg=CARD); row.pack(fill="x", padx=14, pady=12)
     def go():
         d.destroy(); busy["on"] = True; toast("Sending…", True)
@@ -196,9 +210,18 @@ def confirm(title, lines, fn, danger=True):
 # header
 hdr = tk.Frame(root, bg=BG); hdr.pack(fill="x", padx=10, pady=(8, 4))
 dot = tk.Canvas(hdr, width=10, height=10, bg=BG, highlightthickness=0); dot.pack(side="left"); dotid = dot.create_oval(1, 1, 9, 9, fill=AMB, outline="")
-L(hdr, " PROPR", bg=BG, font=(UI, 10, "bold")).pack(side="left"); live = L(hdr, " CONNECTING", AMB, (UI, 8, "bold"), BG); live.pack(side="left")
-xb = B(hdr, "×", lambda: (open(os.path.join(HERE, "closed_by_user.flag"), "w").write("1"), root.destroy()), DIM, BG, CARD2, (UI, 11)); xb.pack(side="right")
-ago = L(hdr, "", DIM, (UI, 8), BG); ago.pack(side="right", padx=6)
+L(hdr, " PROPR", bg=BG, font=F(UI, 10, "bold")).pack(side="left"); live = L(hdr, " CONNECTING", AMB, F(UI, 8, "bold"), BG); live.pack(side="left")
+xb = B(hdr, "×", lambda: (open(os.path.join(HERE, "closed_by_user.flag"), "w").write("1"), root.destroy()), DIM, BG, CARD2, F(UI, 11)); xb.pack(side="right")
+def rescale(d):
+    ns = round(min(1.6, max(0.7, SC["s"] + d)), 2)
+    if ns == SC["s"]: return
+    if SC["w"]: SC["w"] = round(SC["w"] * ns / SC["s"])
+    SC["s"] = ns
+    for (fam, size, *st), f in _FONTS.items(): f.configure(size=max(5, round(size * ns)))
+    relayout(); save_set(); toast(f"Size {int(ns*100)}%")
+B(hdr, "+", lambda: rescale(0.1), SUB, BG, CARD2, F(UI, 10, "bold")).pack(side="right")
+B(hdr, "-", lambda: rescale(-0.1), SUB, BG, CARD2, F(UI, 10, "bold")).pack(side="right")
+ago = L(hdr, "", DIM, F(UI, 8), BG); ago.pack(side="right", padx=6)
 def ds(e): root._d = (e.x_root - root.winfo_x(), e.y_root - root.winfo_y())
 def dm(e): root.geometry(f"+{e.x_root-root._d[0]}+{e.y_root-root._d[1]}")
 def dr(e):
@@ -208,23 +231,41 @@ for w in (hdr, live, ago): w.bind("<Button-1>", ds); w.bind("<B1-Motion>", dm); 
 # equity card
 ec = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=CARD); ec.pack(fill="x", padx=8, pady=4)
 r1 = tk.Frame(ec, bg=CARD); r1.pack(fill="x", padx=12, pady=(10, 0))
-L(r1, "ACCOUNT EQUITY", SUB, (UI, 8, "bold")).pack(side="left"); L(r1, "qEkueeCybEma", DIM, (MONO, 8)).pack(side="right")
-eql = L(ec, "—", TXT, (MONO, 24, "bold")); eql.pack(anchor="w", padx=10)
+L(r1, "ACCOUNT EQUITY", SUB, F(UI, 8, "bold")).pack(side="left"); L(r1, "qEkueeCybEma", DIM, F(MONO, 8)).pack(side="right")
+eql = L(ec, "—", TXT, F(MONO, 24, "bold")); eql.pack(anchor="w", padx=10)
 r2 = tk.Frame(ec, bg=CARD); r2.pack(fill="x", padx=12)
-pnll = L(r2, "", GRN, (MONO, 10, "bold")); pnll.pack(side="left"); upl = L(r2, "", GRN, (MONO, 9)); upl.pack(side="right")
+pnll = L(r2, "", GRN, F(MONO, 10, "bold")); pnll.pack(side="left"); upl = L(r2, "", GRN, F(MONO, 9)); upl.pack(side="right")
 bar = tk.Canvas(ec, height=8, bg=CARD, highlightthickness=0); bar.pack(fill="x", padx=12, pady=(8, 2))
-faill = L(ec, "", SUB, (UI, 7)); faill.pack(anchor="w", padx=12, pady=(0, 2))
+faill = L(ec, "", SUB, F(UI, 7), justify="left"); faill.pack(anchor="w", padx=12, pady=(0, 2))
 tbar = tk.Canvas(ec, height=8, bg=CARD, highlightthickness=0); tbar.pack(fill="x", padx=12, pady=(4, 2))
-tgl = L(ec, "", SUB, (UI, 7)); tgl.pack(anchor="w", padx=12, pady=(0, 8))
-L(root, "POSITIONS", SUB, (UI, 8, "bold"), BG).pack(anchor="w", padx=12, pady=(6, 2))
+tgl = L(ec, "", SUB, F(UI, 7), justify="left"); tgl.pack(anchor="w", padx=12, pady=(0, 8))
+L(root, "POSITIONS", SUB, F(UI, 8, "bold"), BG).pack(anchor="w", padx=12, pady=(6, 2))
 posf = tk.Frame(root, bg=BG); posf.pack(fill="x", padx=8)
-L(root, "ORDERS", SUB, (UI, 8, "bold"), BG).pack(anchor="w", padx=12, pady=(8, 2))
+L(root, "ORDERS", SUB, F(UI, 8, "bold"), BG).pack(anchor="w", padx=12, pady=(8, 2))
 ordf = tk.Frame(root, bg=CARD); ordf.pack(fill="x", padx=8)
-tl = tk.Label(root, font=(UI, 9, "bold"), wraplength=W - 30, justify="left", padx=8, pady=5)
-emerg = B(root, "⚡  EMERGENCY · OPEN TERMINAL", lambda: webbrowser.open(TERM), "white", "#d9304a", "#ff3b55", (UI, 11, "bold"))
+tl = tk.Label(root, font=F(UI, 9, "bold"), wraplength=WW() - 30, justify="left", padx=8, pady=5)
+emerg = B(root, "⚡  EMERGENCY · OPEN TERMINAL", lambda: webbrowser.open(TERM), "white", "#d9304a", "#ff3b55", F(UI, 11, "bold"))
 emerg.config(pady=9); emerg.pack(fill="x", padx=8, pady=(10, 4))
-L(root, f"mini terminal · reduce-only · v{VERSION}", DIM, (UI, 7), BG).pack(pady=(0, 6))
-root.geometry(f"{W}x1"); root.update_idletasks()
+L(root, f"mini terminal · reduce-only · v{VERSION}", DIM, F(UI, 7), BG).pack(pady=(0, 6))
+# v3.4 drag-to-resize: right edge = width, bottom edge = height, corner grip = both
+def relayout():
+    w = WW(); tl.config(wraplength=w - 30); faill.config(wraplength=w - 40); tgl.config(wraplength=w - 40)
+    rows["sig"] = None   # rebuild rows so they reflow to the new width
+    for r in rows["ord"].values(): r["lab"].config(wraplength=w - 60)
+    root.geometry(f"{w}x{root.winfo_reqheight() + SC['h']}")
+def rs_start(e): root._r = (e.x_root, e.y_root, root.winfo_width(), SC["h"])
+def rs_move(e, wx, hy):
+    x0, y0, w0, h0 = root._r
+    if wx: SC["w"] = int(max(260, min(1200, w0 + e.x_root - x0)))
+    if hy: SC["h"] = int(max(0, min(1200, h0 + e.y_root - y0)))
+    relayout()
+def rs_end(e): save_set()
+for cur, wx, hy, place in (("sb_h_double_arrow", 1, 0, dict(relx=1, x=-5, y=0, width=5, relheight=1)),
+                            ("sb_v_double_arrow", 0, 1, dict(x=0, rely=1, y=-5, height=5, relwidth=1)),
+                            ("bottom_right_corner", 1, 1, dict(relx=1, rely=1, x=-14, y=-14, width=14, height=14))):
+    g = tk.Label(root, text="◢" if wx and hy else "", fg=DIM, bg=BG, font=F(UI, 7), cursor=cur)
+    g.place(**place); g.bind("<Button-1>", rs_start); g.bind("<B1-Motion>", lambda e, a=wx, b=hy: rs_move(e, a, b)); g.bind("<ButtonRelease-1>", rs_end)
+root.geometry(f"{WW()}x1"); root.update_idletasks(); faill.config(wraplength=WW() - 40); tgl.config(wraplength=WW() - 40)
 set_noactivate(root); OWN.add(hwnd_of(root))
 # Typing in SL/TP boxes needs keyboard focus: allow it only after Kenny clicks a box, drop it again on focus-out.
 def _ent_click(e):
@@ -245,39 +286,42 @@ def build():
         tk.Frame(card, bg=sc, width=4).pack(side="left", fill="y")
         inn = tk.Frame(card, bg=CARD); inn.pack(side="left", fill="x", expand=True, padx=8, pady=6)
         t = tk.Frame(inn, bg=CARD); t.pack(fill="x")
-        L(t, p.get("base") or p["asset"], font=(UI, 11, "bold")).pack(side="left")
-        L(t, f" {side.upper()} {p.get('leverage','')}x ", sc, (UI, 8, "bold"), CARD2).pack(side="left", padx=6)
-        pxl = L(t, "", TXT, (MONO, 10, "bold")); pxl.pack(side="left")
-        u = L(t, "", font=(MONO, 12, "bold")); u.pack(side="right")
-        info = L(inn, "", SUB, (MONO, 8)); info.pack(anchor="w", pady=(2, 3))
+        L(t, p.get("base") or p["asset"], font=F(UI, 11, "bold")).pack(side="left")
+        L(t, f" {side.upper()} {p.get('leverage','')}x ", sc, F(UI, 8, "bold"), CARD2).pack(side="left", padx=6)
+        pxl = L(t, "", TXT, F(MONO, 10, "bold")); pxl.pack(side="left")
+        u = L(t, "", font=F(MONO, 12, "bold")); u.pack(side="right")
+        info = L(inn, "", SUB, F(MONO, 8), justify="left", wraplength=WW() - 50); info.pack(anchor="w", pady=(2, 3))
         bd = tk.Frame(inn, bg=CARD); bd.pack(fill="x")
-        slb = L(bd, "", font=(UI, 8, "bold")); slb.pack(side="left"); tpb = L(bd, "", font=(UI, 8, "bold")); tpb.pack(side="left", padx=5)
+        slb = L(bd, "", font=F(UI, 8, "bold")); slb.pack(side="left"); tpb = L(bd, "", font=F(UI, 8, "bold")); tpb.pack(side="left", padx=5)
         ed = tk.Frame(inn, bg=CARD); ed.pack(fill="x", pady=(5, 0))
         ents = {}
         for kind, lab in (("stop_market", "SL"), ("take_profit_market", "TP")):
-            L(ed, lab, DIM, (UI, 8)).pack(side="left")
-            e = tk.Entry(ed, width=9, bg=CARD2, fg=TXT, insertbackground=TXT, relief="flat", font=(MONO, 9), takefocus=0); e.pack(side="left", padx=(3, 2), ipady=2)
+            if WW() < 360 and kind == "take_profit_market": ed = tk.Frame(inn, bg=CARD); ed.pack(fill="x", pady=(3, 0))
+            L(ed, lab, DIM, F(UI, 8)).pack(side="left")
+            e = tk.Entry(ed, width=9, bg=CARD2, fg=TXT, insertbackground=TXT, relief="flat", font=F(MONO, 9), takefocus=0); e.pack(side="left", padx=(3, 2), ipady=2)
             e.bind("<Button-1>", _ent_click, add="+"); e.bind("<FocusOut>", _ent_leave, add="+")
             ex = brackets(p, kind)
             if ex: e.insert(0, ex[0].get("triggerPrice"))
             B(ed, "Set", lambda p=p, k=kind, e=e: ask_set(p, k, e.get()), TXT, BLU if True else CARD2, "#5b9bff").pack(side="left", padx=(0, 8))
             ents[kind] = e
         ac = tk.Frame(inn, bg=CARD); ac.pack(fill="x", pady=(5, 0))
-        L(ac, "Close", DIM, (UI, 8)).pack(side="left", padx=(0, 3))
+        L(ac, "Close", DIM, F(UI, 8)).pack(side="left", padx=(0, 3))
         for fr in (0.25, 0.5, 0.75):
             B(ac, f"{int(fr*100)}%", lambda p=p, fr=fr: ask_close(p, fr)).pack(side="left", padx=(0, 3))
         B(ac, "100%", lambda p=p: ask_close(p, 1.0), "white", "#7a2230", RED).pack(side="left", padx=(0, 6))
+        if WW() < 360: ac = tk.Frame(inn, bg=CARD); ac.pack(fill="x", pady=(4, 0))   # narrow: own line, never clipped
         B(ac, "Stop→Entry", lambda p=p: ask_set(p, "stop_market", p.get("entryPrice"), be=True)).pack(side="left")
         rows["pos"][p["positionId"]] = dict(px=pxl, card=card, u=u, info=info, slb=slb, tpb=tpb)
     if not D["ords"]: L(ordf, "No working orders", DIM, pady=8).pack(fill="x")
     for o in D["ords"]:
         r = tk.Frame(ordf, bg=CARD); r.pack(fill="x", padx=8, pady=2)
         s = (o.get("side") or "").lower(); typ = {"limit": "LIMIT", "stop_market": "STOP", "take_profit_market": "TP", "market": "MKT"}.get(o.get("type"), (o.get("type") or "").upper())
-        L(r, o.get("base") or o.get("asset"), font=(UI, 9, "bold"), width=6, anchor="w").pack(side="left")
-        L(r, f"{typ} {s.upper()}", GRN if s == "buy" else RED, (UI, 8, "bold"), width=10, anchor="w").pack(side="left")
-        op = L(r, "", DIM, (MONO, 8)); op.pack(side="left"); rows["ord"][o["orderId"]] = dict(px=op, asset=o.get("asset"))
+        L(r, o.get("base") or o.get("asset"), font=F(UI, 9, "bold"), anchor="w").pack(side="left")
+        L(r, f"{typ} {s.upper()}", GRN if s == "buy" else RED, F(UI, 8, "bold"), anchor="w").pack(side="left", padx=6)
         B(r, "Cancel", lambda o=o: ask_cancel(o), SUB, CARD2, "#5a1a24").pack(side="right")
-        L(r, f"{qty(o.get('quantity'))} @ {fpx(o.get('price') or o.get('triggerPrice'))}", SUB, (MONO, 8)).pack(side="right", padx=6)
+        r2 = tk.Frame(ordf, bg=CARD); r2.pack(fill="x", padx=8, pady=(0, 3))   # v3.4: price on its own line, wraps instead of clipping
+        op = L(r2, "", SUB, F(MONO, 8), justify="left", anchor="w", wraplength=WW() - 60); op.pack(side="left", fill="x")
+        rows["ord"][o["orderId"]] = dict(px=op, lab=op, asset=o.get("asset"), txt=f"{qty(o.get('quantity'))} @ {fpx(o.get('price') or o.get('triggerPrice'))}")
 def ask_close(p, frac):
     q = q_str(abs(n(p["quantity"])) * frac, p["asset"]); m = mark(p)
     confirm(f"Close {int(frac*100)}%", [f"{p.get('base')} {p['positionSide'].upper()}", f"MARKET {exit_side(p).upper()} {q} (reduce-only)",
@@ -303,7 +347,7 @@ def tick():
         now = time.time(); fresh = D["mt"] and now - D["mt"] < 10; pl = D["ok"] and now - D["t"] < 20
         c = GRN if fresh and pl else (RED if D["ok"] is False else AMB); dot.itemconfig(dotid, fill=c)
         live.config(text=" LIVE" if fresh and pl else (" RECONNECTING" if D["ok"] is False or (D["mt"] and not fresh) else " CONNECTING"), fg=c)
-        ago.config(text=f"updated {int(now - D['mt'])}s ago" if D["mt"] else "waiting for prices")
+        ago.config(text=(f"{max(0, int(now - D['mt']))}s ago" if WW() < 340 else f"updated {max(0, int(now - D['mt']))}s ago") if D["mt"] else "waiting")
         a = D["a"]
         if a:
             sig = (tuple(p["positionId"] for p in D["pos"]), tuple((o["orderId"], o.get("triggerPrice"), o.get("price")) for o in D["ords"]))
@@ -315,7 +359,7 @@ def tick():
             pnll.config(text=f"{'▲' if pnl >= 0 else '▼'} {pnl:+,.2f} ({pct:+.2f}%) today", fg=GRN if pnl >= 0 else RED)
             upl.config(text=f"uPnL {lu:+,.2f}", fg=GRN if lu >= 0 else RED)
             ec.config(highlightbackground=RED if room <= 100 else CARD)
-            bar.delete("all"); bw = bar.winfo_width() or W - 40; fr = max(0, min(1, room / 500))
+            bar.delete("all"); bw = bar.winfo_width() or WW() - 40; fr = max(0, min(1, room / 500))
             bar.create_rectangle(0, 0, bw, 8, fill=CARD2, outline=""); bar.create_rectangle(0, 0, bw * fr, 8, fill=RED if room <= 100 else AMB if room <= 250 else GRN, outline="")
             faill.config(text=f"Safety: ${room:,.2f} above fail line ${FAIL:,.0f}" + ("   ⚠ DANGER" if room <= 100 else ""), fg=RED if room <= 100 else SUB)
             tbar.delete("all"); tf = max(0, min(1, (eq - 10000) / (TARGET - 10000))) if TARGET > 10000 else 0
@@ -332,8 +376,9 @@ def tick():
                 r["tpb"].config(text=f" TP {', '.join(fpx(o.get('triggerPrice')) for o in tp)} " if tp else " NO TP ", fg=TXT if tp else DIM, bg="#123528" if tp else CARD2)
                 r["card"].config(highlightbackground=CARD if sl else RED)
             for r in rows["ord"].values():
-                mp = n(D["mids"].get(r["asset"])); r["px"].config(text=f"now ${fpx(mp)}" if mp else "")
-        root.geometry(f"{W}x{root.winfo_reqheight()}")
+                mp = n(D["mids"].get(r["asset"])); r["px"].config(text=r["txt"] + (f"   ·   now ${fpx(mp)}" if mp else ""))
+        g = f"{WW()}x{root.winfo_reqheight() + SC['h']}"
+        if root.geometry().split("+")[0] != g: root.geometry(g)
     except Exception: pass
     root.after(500, tick)
 def keep_top():
