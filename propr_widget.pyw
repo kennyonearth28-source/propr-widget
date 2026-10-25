@@ -1,6 +1,6 @@
 # Propr Live - mini corner terminal. Only REDUCE-ONLY orders on existing positions + cancels. Never opens positions.
-VERSION = "3.2.0"
-import json, os, threading, time, urllib.request, webbrowser, datetime, math, tkinter as tk, tkinter.font as tkf
+VERSION = "3.3.0"
+import ctypes, sys, json, os, threading, time, urllib.request, webbrowser, datetime, math, tkinter as tk, tkinter.font as tkf
 HERE = os.path.dirname(os.path.abspath(__file__))
 try: C = json.load(open(os.path.join(HERE, "config.json")))
 except Exception: C = {}
@@ -116,6 +116,51 @@ def replace(p, kind, price):
         except Exception: errs += 1
     return f"{'Stop' if kind=='stop_market' else 'TP'} set {ps}" + (f" ({errs} old not cancelled)" if errs else "")
 
+# ---------------- Win32 no-focus helpers ----------------
+WIN = sys.platform == "win32"
+GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_APPWINDOW = -20, 0x08000000, 0x00000080, 0x00040000
+SWP = 0x0001 | 0x0002 | 0x0010  # NOSIZE|NOMOVE|NOACTIVATE
+if WIN:
+    U32 = ctypes.windll.user32
+    U32.GetParent.restype = ctypes.c_void_p; U32.GetParent.argtypes = [ctypes.c_void_p]
+    U32.GetForegroundWindow.restype = ctypes.c_void_p
+    U32.MonitorFromWindow.restype = ctypes.c_void_p; U32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    U32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    U32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]; U32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+    U32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p]; U32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    U32.GetAncestor.restype = ctypes.c_void_p; U32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    U32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+class RECT(ctypes.Structure): _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long), ("r", ctypes.c_long), ("b", ctypes.c_long)]
+class MINFO(ctypes.Structure): _fields_ = [("cb", ctypes.c_ulong), ("mon", RECT), ("work", RECT), ("flags", ctypes.c_ulong)]
+def hwnd_of(w):
+    try: return U32.GetParent(w.winfo_id()) or w.winfo_id()
+    except Exception: return None
+def set_noactivate(w, on=True):
+    if not WIN: return
+    try:
+        h = hwnd_of(w); st = U32.GetWindowLongW(h, GWL_EXSTYLE)
+        st = (st | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW if on else st & ~WS_EX_NOACTIVATE
+        U32.SetWindowLongW(h, GWL_EXSTYLE, st)
+    except Exception: pass
+def top_noactivate(w):
+    if not WIN: return
+    try: U32.SetWindowPos(hwnd_of(w), ctypes.c_void_p(-1), 0, 0, 0, 0, SWP)
+    except Exception: pass
+OWN = set()
+def fullscreen_fg():
+    """True if some other app's window covers its whole monitor and is in the foreground (game mode)."""
+    if not WIN: return False
+    try:
+        fg = U32.GetForegroundWindow()
+        if not fg or fg in OWN or U32.GetAncestor(fg, 2) in OWN: return False
+        cls = ctypes.create_unicode_buffer(64); U32.GetClassNameW(fg, cls, 64)
+        if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd"): return False
+        r = RECT(); U32.GetWindowRect(fg, ctypes.byref(r))
+        mi = MINFO(); mi.cb = ctypes.sizeof(MINFO); U32.GetMonitorInfoW(U32.MonitorFromWindow(fg, 2), ctypes.byref(mi))
+        m = mi.mon; return r.l <= m.l and r.t <= m.t and r.r >= m.r and r.b >= m.b
+    except Exception: return False
+GAME = os.path.join(HERE, "game_mode.flag")  # launcher reads this: no update restarts while it exists
+
 # ---------------- UI ----------------
 root = tk.Tk(); root.title("Propr Live"); root.overrideredirect(True)
 root.attributes("-topmost", True); root.attributes("-alpha", 0.95); root.configure(bg=BG, highlightthickness=1, highlightbackground=LINE)
@@ -146,7 +191,7 @@ def confirm(title, lines, fn, danger=True):
         threading.Thread(target=run, daemon=True).start()
     B(row, "Cancel", d.destroy).pack(side="right", padx=(6, 0))
     B(row, "CONFIRM", go, "white", RED if danger else BLU, "#ff3b55" if danger else "#5b9bff").pack(side="right")
-    d.update_idletasks(); d.geometry(f"+{root.winfo_x()+20}+{root.winfo_y()+120}"); d.grab_set(); d.focus_force()
+    d.update_idletasks(); d.geometry(f"+{root.winfo_x()+20}+{root.winfo_y()+120}"); OWN.add(hwnd_of(d)); d.grab_set(); d.focus_force()  # only ever opened by Kenny's click
 
 # header
 hdr = tk.Frame(root, bg=BG); hdr.pack(fill="x", padx=10, pady=(8, 4))
@@ -180,6 +225,14 @@ emerg = B(root, "⚡  EMERGENCY · OPEN TERMINAL", lambda: webbrowser.open(TERM)
 emerg.config(pady=9); emerg.pack(fill="x", padx=8, pady=(10, 4))
 L(root, f"mini terminal · reduce-only · v{VERSION}", DIM, (UI, 7), BG).pack(pady=(0, 6))
 root.geometry(f"{W}x1"); root.update_idletasks()
+set_noactivate(root); OWN.add(hwnd_of(root))
+# Typing in SL/TP boxes needs keyboard focus: allow it only after Kenny clicks a box, drop it again on focus-out.
+def _ent_click(e):
+    set_noactivate(root, False)
+    try: U32.SetForegroundWindow(hwnd_of(root)) if WIN else None
+    except Exception: pass
+    e.widget.focus_set()
+def _ent_leave(e): root.after(50, lambda: set_noactivate(root, True))
 
 rows = {"sig": None, "pos": {}, "ord": {}}
 def build():
@@ -194,6 +247,7 @@ def build():
         t = tk.Frame(inn, bg=CARD); t.pack(fill="x")
         L(t, p.get("base") or p["asset"], font=(UI, 11, "bold")).pack(side="left")
         L(t, f" {side.upper()} {p.get('leverage','')}x ", sc, (UI, 8, "bold"), CARD2).pack(side="left", padx=6)
+        pxl = L(t, "", TXT, (MONO, 10, "bold")); pxl.pack(side="left")
         u = L(t, "", font=(MONO, 12, "bold")); u.pack(side="right")
         info = L(inn, "", SUB, (MONO, 8)); info.pack(anchor="w", pady=(2, 3))
         bd = tk.Frame(inn, bg=CARD); bd.pack(fill="x")
@@ -202,7 +256,8 @@ def build():
         ents = {}
         for kind, lab in (("stop_market", "SL"), ("take_profit_market", "TP")):
             L(ed, lab, DIM, (UI, 8)).pack(side="left")
-            e = tk.Entry(ed, width=9, bg=CARD2, fg=TXT, insertbackground=TXT, relief="flat", font=(MONO, 9)); e.pack(side="left", padx=(3, 2), ipady=2)
+            e = tk.Entry(ed, width=9, bg=CARD2, fg=TXT, insertbackground=TXT, relief="flat", font=(MONO, 9), takefocus=0); e.pack(side="left", padx=(3, 2), ipady=2)
+            e.bind("<Button-1>", _ent_click, add="+"); e.bind("<FocusOut>", _ent_leave, add="+")
             ex = brackets(p, kind)
             if ex: e.insert(0, ex[0].get("triggerPrice"))
             B(ed, "Set", lambda p=p, k=kind, e=e: ask_set(p, k, e.get()), TXT, BLU if True else CARD2, "#5b9bff").pack(side="left", padx=(0, 8))
@@ -213,13 +268,14 @@ def build():
             B(ac, f"{int(fr*100)}%", lambda p=p, fr=fr: ask_close(p, fr)).pack(side="left", padx=(0, 3))
         B(ac, "100%", lambda p=p: ask_close(p, 1.0), "white", "#7a2230", RED).pack(side="left", padx=(0, 6))
         B(ac, "Stop→Entry", lambda p=p: ask_set(p, "stop_market", p.get("entryPrice"), be=True)).pack(side="left")
-        rows["pos"][p["positionId"]] = dict(card=card, u=u, info=info, slb=slb, tpb=tpb)
+        rows["pos"][p["positionId"]] = dict(px=pxl, card=card, u=u, info=info, slb=slb, tpb=tpb)
     if not D["ords"]: L(ordf, "No working orders", DIM, pady=8).pack(fill="x")
     for o in D["ords"]:
         r = tk.Frame(ordf, bg=CARD); r.pack(fill="x", padx=8, pady=2)
         s = (o.get("side") or "").lower(); typ = {"limit": "LIMIT", "stop_market": "STOP", "take_profit_market": "TP", "market": "MKT"}.get(o.get("type"), (o.get("type") or "").upper())
         L(r, o.get("base") or o.get("asset"), font=(UI, 9, "bold"), width=6, anchor="w").pack(side="left")
         L(r, f"{typ} {s.upper()}", GRN if s == "buy" else RED, (UI, 8, "bold"), width=10, anchor="w").pack(side="left")
+        op = L(r, "", DIM, (MONO, 8)); op.pack(side="left"); rows["ord"][o["orderId"]] = dict(px=op, asset=o.get("asset"))
         B(r, "Cancel", lambda o=o: ask_cancel(o), SUB, CARD2, "#5a1a24").pack(side="right")
         L(r, f"{qty(o.get('quantity'))} @ {fpx(o.get('price') or o.get('triggerPrice'))}", SUB, (MONO, 8)).pack(side="right", padx=6)
 def ask_close(p, frac):
@@ -268,17 +324,26 @@ def tick():
             for p in D["pos"]:
                 r = rows["pos"].get(p["positionId"])
                 if not r: continue
+                mp = mark(p); r["px"].config(text=f"${fpx(mp)}" if mp else "")
                 u = upnl(p); r["u"].config(text=f"{u:+,.2f}", fg=GRN if u >= 0 else RED)
                 r["info"].config(text=f"Size {qty(p.get('quantity'))}  Entry {fpx(p.get('entryPrice'))}  Mark {fpx(mark(p))}")
                 sl = brackets(p, "stop_market"); tp = brackets(p, "take_profit_market")
                 r["slb"].config(text=f" SL {', '.join(fpx(o.get('triggerPrice')) for o in sl)} " if sl else " ⚠ NO STOP ", fg=TXT if sl else "white", bg="#3a1d24" if sl else RED)
                 r["tpb"].config(text=f" TP {', '.join(fpx(o.get('triggerPrice')) for o in tp)} " if tp else " NO TP ", fg=TXT if tp else DIM, bg="#123528" if tp else CARD2)
                 r["card"].config(highlightbackground=CARD if sl else RED)
+            for r in rows["ord"].values():
+                mp = n(D["mids"].get(r["asset"])); r["px"].config(text=f"now ${fpx(mp)}" if mp else "")
         root.geometry(f"{W}x{root.winfo_reqheight()}")
     except Exception: pass
     root.after(500, tick)
 def keep_top():
-    try: root.attributes("-topmost", True)
+    try:
+        gm = fullscreen_fg()
+        if gm:
+            if not os.path.exists(GAME): open(GAME, "w").write("1")
+        else:
+            if os.path.exists(GAME): os.remove(GAME)
+            top_noactivate(root)  # SWP_NOACTIVATE: never steals focus
     except Exception: pass
     root.after(3000, keep_top)
 for f in (propr_loop, price_loop): threading.Thread(target=f, daemon=True).start()
