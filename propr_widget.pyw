@@ -1,5 +1,5 @@
 # Propr Live - mini corner terminal. Only REDUCE-ONLY orders on existing positions + cancels. Never opens positions.
-VERSION = "3.4.1"
+VERSION = "3.4.2"
 import ctypes, sys, json, os, threading, time, urllib.request, webbrowser, datetime, math, tkinter as tk, tkinter.font as tkf
 HERE = os.path.dirname(os.path.abspath(__file__))
 try: C = json.load(open(os.path.join(HERE, "config.json")))
@@ -170,14 +170,15 @@ MONO = "Cascadia Mono" if "Cascadia Mono" in fams else "Consolas"
 SET_F = os.path.join(HERE, "settings.json")
 try: S = json.load(open(SET_F))
 except Exception: S = {}
-SC = {"s": min(1.6, max(0.7, float(S.get("scale", 1.0)))), "w": int(S.get("width", 0) or 0), "h": int(S.get("extra_h", 0) or 0)}
+MINI = {"on": bool(S.get("mini", False))}
+SC = {"s": min(1.6, max(0.6, float(S.get("scale", 1.0)))), "w": int(S.get("width", 0) or 0), "h": int(S.get("extra_h", 0) or 0)}
 # v3.4.1 position lives in settings.json (pos.json read once for migration)
 POS = {"x": S.get("x"), "y": S.get("y")}
 if POS["x"] is None:
     try: g = json.load(open(os.path.join(HERE, "pos.json"))); POS = {"x": int(g["x"]), "y": int(g["y"])}
     except Exception: POS = {"x": None, "y": None}
 def save_set():
-    try: json.dump({"scale": SC["s"], "width": SC["w"], "extra_h": SC["h"], "x": root.winfo_x(), "y": root.winfo_y()}, open(SET_F, "w"))
+    try: json.dump({"scale": SC["s"], "width": SC["w"], "extra_h": SC["h"], "mini": MINI["on"], "x": root.winfo_x(), "y": root.winfo_y()}, open(SET_F, "w"))
     except Exception: pass
 _FONTS = {}
 def F(fam, size, *st):
@@ -191,7 +192,7 @@ def B(par, text, cmd, fg=TXT, bg=CARD2, hov=LINE, font=None):
     b.bind("<Enter>", lambda e: b.config(bg=hov)); b.bind("<Leave>", lambda e: b.config(bg=bg)); b.bind("<Button-1>", lambda e: cmd()); return b
 busy = {"on": False}
 def toast(msg, ok=True):
-    tl.config(text=msg, fg="white", bg="#11402c" if ok else "#5a1a24"); tl.pack(fill="x", padx=8, pady=(0, 4), before=emerg)
+    tl.config(text=msg, fg="white", bg="#11402c" if ok else "#5a1a24"); tl.pack(fill="x", padx=8, pady=(0, 4), **({"before": emerg} if emerg.winfo_ismapped() else {}))
     root.after(7000, lambda: tl.pack_forget() if tl.cget("text") == msg else None)
 def confirm(title, lines, fn, danger=True):
     if busy["on"]: toast("Another action is running", False); return
@@ -216,13 +217,14 @@ dot = tk.Canvas(hdr, width=10, height=10, bg=BG, highlightthickness=0); dot.pack
 L(hdr, " PROPR", bg=BG, font=F(UI, 10, "bold")).pack(side="left"); live = L(hdr, " CONNECTING", AMB, F(UI, 8, "bold"), BG); live.pack(side="left")
 xb = B(hdr, "×", lambda: (open(os.path.join(HERE, "closed_by_user.flag"), "w").write("1"), root.destroy()), DIM, BG, CARD2, F(UI, 11)); xb.pack(side="right")
 def rescale(d):
-    ns = round(min(1.6, max(0.7, SC["s"] + d)), 2)
-    if ns == SC["s"]: return
+    ns = round(min(1.6, max(0.6, SC["s"] + d)), 2)
+    if ns == SC["s"]: toast(f"Size {int(ns*100)}% (limit)"); return
     if SC["w"]: SC["w"] = round(SC["w"] * ns / SC["s"])
     SC["s"] = ns
     for (fam, size, *st), f in _FONTS.items(): f.configure(size=max(5, round(size * ns)))
     relayout(); save_set(); toast(f"Size {int(ns*100)}%")
-HDR_BTNS = [xb, B(hdr, "+", lambda: rescale(0.1), SUB, BG, CARD2, F(UI, 10, "bold")), B(hdr, "-", lambda: rescale(-0.1), SUB, BG, CARD2, F(UI, 10, "bold"))]
+HDR_BTNS = [xb, B(hdr, "+", lambda: rescale(0.1), SUB, BG, CARD2, F(UI, 10, "bold")), B(hdr, "−", lambda: rescale(-0.1), SUB, BG, CARD2, F(UI, 10, "bold")),
+            B(hdr, "▭", lambda: toggle_mini(), SUB, BG, CARD2, F(UI, 9, "bold"))]
 for b_ in HDR_BTNS[1:]: b_.pack(side="right")
 ago = L(hdr, "", DIM, F(UI, 8), BG); ago.pack(side="right", padx=6)
 # v3.4.1 move: manual drag on the whole header (works without activation), always clamped to the monitor work area
@@ -240,16 +242,20 @@ def work_area(x, y):
 def clamp(x, y, w, h):
     l, t, r, b = work_area(x + w // 2, y + min(h, 40) // 2)
     x = max(l, min(x, r - w)); y = max(t, min(y, b - h)); return x, y
-def place_win(x=None, y=None):
-    """Fit height to the work area (list scrolls instead), then clamp position."""
+def place_win(x=None, y=None, grow=True):
+    """Fit height to the work area (list scrolls instead), then clamp position. grow=False never enlarges (0.5s tick)."""
     x = root.winfo_x() if x is None else x; y = root.winfo_y() if y is None else y
-    w = WW(); l, t, r, b = work_area(x + w // 2, y + 20)
-    inner_h = inner.winfo_reqheight() + SC["h"]; other = root.winfo_reqheight() - body.winfo_reqheight()
-    ch = max(60, min(inner_h, (b - t) - other)); w = min(w, r - l)
-    if int(body.cget("height")) != ch: body.config(height=ch)
-    h = other + ch; x, y = clamp(x, y, w, h); g = f"{w}x{h}+{x}+{y}"
+    w = WW(); l, t, r, b = work_area(x + w // 2, y + 20); w = min(w, r - l)
+    if MINI["on"]:
+        h = min(root.winfo_reqheight(), b - t)
+    else:
+        full_h = inner.winfo_reqheight(); inner_h = full_h + SC["h"]; other = root.winfo_reqheight() - body.winfo_reqheight()
+        ch = max(40, min(inner_h, (b - t) - other))
+        if not grow: ch = min(ch, max(40, int(body.cget("height"))))
+        if int(body.cget("height")) != ch: body.config(height=ch)
+        h = other + ch; sbar_show(full_h > ch)
+    x, y = clamp(x, y, w, h); g = f"{w}x{h}+{x}+{y}"
     if root.geometry() != g: root.geometry(g)
-    sbar_show(inner_h > ch)
 def ds(e): root._d = (e.x_root - root.winfo_x(), e.y_root - root.winfo_y())
 def dm(e):
     if hasattr(root, "_d"): place_win(e.x_root - root._d[0], e.y_root - root._d[1])
@@ -294,6 +300,37 @@ tl = tk.Label(root, font=F(UI, 9, "bold"), wraplength=WW() - 30, justify="left",
 emerg = B(root, "⚡  EMERGENCY · OPEN TERMINAL", lambda: webbrowser.open(TERM), "white", "#d9304a", "#ff3b55", F(UI, 11, "bold"))
 emerg.config(pady=9); emerg.pack(fill="x", padx=8, pady=(10, 4))
 L(root, f"mini terminal · reduce-only · v{VERSION}", DIM, F(UI, 7), BG).pack(pady=(0, 6))
+# v3.4.2 mini mode: equity, uPnL, one line per position
+minif = tk.Frame(root, bg=CARD)
+m_eq = L(minif, "", TXT, F(MONO, 12, "bold"), anchor="w"); m_eq.pack(fill="x", padx=10, pady=(4, 0))
+m_up = L(minif, "", SUB, F(MONO, 9), anchor="w"); m_up.pack(fill="x", padx=10)
+m_pos = tk.Frame(minif, bg=CARD); m_pos.pack(fill="x", padx=10, pady=(0, 4))
+FOOT = root.pack_slaves()[-1]
+FULL = [ec, bodyf, emerg, FOOT]
+def toggle_mini(e=None, init=False):
+    if not init: MINI["on"] = not MINI["on"]
+    if MINI["on"]:
+        for w_ in FULL + [tl]: w_.pack_forget()
+        minif.pack(fill="x", padx=8, pady=(0, 8), after=hdr)
+    else:
+        minif.pack_forget()
+        ec.pack(fill="x", padx=8, pady=4, after=hdr); bodyf.pack(fill="x", after=ec)
+        emerg.pack(fill="x", padx=8, pady=(10, 4), after=bodyf); FOOT.pack(pady=(0, 6), after=emerg)
+    root.update_idletasks(); place_win()
+    if not init: save_set()
+for w_ in (m_eq, m_up, minif): w_.bind("<Double-Button-1>", toggle_mini)
+eql.bind("<Double-Button-1>", toggle_mini)
+def mini_tick(eq, lu):
+    m_eq.config(text=f"${eq:,.2f}"); m_up.config(text=f"uPnL {lu:+,.2f}", fg=GRN if lu >= 0 else RED)
+    ws = m_pos.winfo_children()
+    if len(ws) != max(1, len(D["pos"])):
+        for w_ in ws: w_.destroy()
+        ws = [L(m_pos, "", SUB, F(MONO, 9), anchor="w") for _ in range(max(1, len(D["pos"])))]
+        for w_ in ws: w_.pack(fill="x"); w_.bind("<Double-Button-1>", toggle_mini)
+        root.update_idletasks(); place_win()
+    if not D["pos"]: ws[0].config(text="No open positions", fg=DIM)
+    for w_, p in zip(ws, D["pos"]):
+        u = upnl(p); w_.config(text=f"{p.get('base') or p['asset']} {(p.get('positionSide') or '')[:1].upper()} {fpx(mark(p))}  {u:+,.2f}", fg=GRN if u >= 0 else RED)
 # v3.4 drag-to-resize: right edge = width, bottom edge = height, corner grip = both
 def relayout():
     w = WW(); tl.config(wraplength=w - 30); faill.config(wraplength=w - 40); tgl.config(wraplength=w - 40)
@@ -304,9 +341,9 @@ def rs_start(e): root._r = (e.x_root, e.y_root, root.winfo_width(), SC["h"])
 def rs_move(e, wx, hy):
     x0, y0, w0, h0 = root._r
     if wx: SC["w"] = int(max(260, min(1200, w0 + e.x_root - x0)))
-    if hy: SC["h"] = int(max(0, min(1200, h0 + e.y_root - y0)))
+    if hy: SC["h"] = int(max(-(inner.winfo_reqheight() - 40), min(0, h0 + e.y_root - y0)))   # v3.4.2: can shrink below content; list scrolls
     relayout()
-def rs_end(e): save_set()
+def rs_end(e): root.__dict__.pop("_r", None); save_set()
 for cur, wx, hy, place in (("sb_h_double_arrow", 1, 0, dict(relx=1, x=-5, y=0, width=5, relheight=1)),
                             ("sb_v_double_arrow", 0, 1, dict(x=0, rely=1, y=-5, height=5, relwidth=1)),
                             ("bottom_right_corner", 1, 1, dict(relx=1, rely=1, x=-14, y=-14, width=14, height=14))):
@@ -314,6 +351,7 @@ for cur, wx, hy, place in (("sb_h_double_arrow", 1, 0, dict(relx=1, x=-5, y=0, w
     g.place(**place); g.bind("<Button-1>", rs_start); g.bind("<B1-Motion>", lambda e, a=wx, b=hy: rs_move(e, a, b)); g.bind("<ButtonRelease-1>", rs_end)
 root.geometry(f"{WW()}x1+{POS['x'] if POS['x'] is not None else 40}+{POS['y'] if POS['y'] is not None else 40}"); root.update_idletasks(); place_win(); faill.config(wraplength=WW() - 40); tgl.config(wraplength=WW() - 40)
 set_noactivate(root); OWN.add(hwnd_of(root))
+if MINI["on"]: toggle_mini(init=True)
 # Typing in SL/TP boxes needs keyboard focus: allow it only after Kenny clicks a box, drop it again on focus-out.
 def _ent_click(e):
     set_noactivate(root, False)
@@ -399,9 +437,10 @@ def tick():
         if a:
             sig = (tuple(p["positionId"] for p in D["pos"]), tuple((o["orderId"], o.get("triggerPrice"), o.get("price")) for o in D["ords"]))
             if sig != rows["sig"] and not busy["on"] and not (root.focus_get().__class__ is tk.Entry):
-                rows["sig"] = sig; build()
+                rows["sig"] = sig; build(); root.update_idletasks(); place_win()
             lu = sum(upnl(p) for p in D["pos"]); eq = n(a.get("marginBalance")) - n(a.get("totalUnrealizedPnl")) + lu
             base = day_start(n(a.get("marginBalance"))); pnl = eq - base; pct = pnl / base * 100 if base else 0; room = eq - FAIL
+            mini_tick(eq, lu)
             eql.config(text=f"${eq:,.2f}", fg=RED if room <= 100 else TXT)
             pnll.config(text=f"{'▲' if pnl >= 0 else '▼'} {pnl:+,.2f} ({pct:+.2f}%) today", fg=GRN if pnl >= 0 else RED)
             upl.config(text=f"uPnL {lu:+,.2f}", fg=GRN if lu >= 0 else RED)
@@ -424,7 +463,7 @@ def tick():
                 r["card"].config(highlightbackground=CARD if sl else RED)
             for r in rows["ord"].values():
                 mp = n(D["mids"].get(r["asset"])); r["px"].config(text=r["txt"] + (f"   ·   now ${fpx(mp)}" if mp else ""))
-        if not hasattr(root, "_d"): place_win()   # keep fitted + on-screen (also after monitor/taskbar changes)
+        if not hasattr(root, "_d") and not hasattr(root, "_r"): place_win(grow=False)   # v3.4.2: keep on-screen, never enlarge   # keep fitted + on-screen (also after monitor/taskbar changes)
     except Exception: pass
     root.after(500, tick)
 def keep_top():
