@@ -1,5 +1,5 @@
 # Propr Live - mini corner terminal. Only REDUCE-ONLY orders on existing positions + cancels. Never opens positions.
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 import json, os, threading, time, urllib.request, webbrowser, datetime, math, tkinter as tk, tkinter.font as tkf
 HERE = os.path.dirname(os.path.abspath(__file__))
 try: C = json.load(open(os.path.join(HERE, "config.json")))
@@ -208,9 +208,11 @@ def build():
             B(ed, "Set", lambda p=p, k=kind, e=e: ask_set(p, k, e.get()), TXT, BLU if True else CARD2, "#5b9bff").pack(side="left", padx=(0, 8))
             ents[kind] = e
         ac = tk.Frame(inn, bg=CARD); ac.pack(fill="x", pady=(5, 0))
-        B(ac, "Close 50%", lambda p=p: ask_close(p, 0.5)).pack(side="left")
-        B(ac, "Close All", lambda p=p: ask_close(p, 1.0), "white", "#7a2230", RED).pack(side="left", padx=5)
-        B(ac, "Stop → Entry", lambda p=p: ask_set(p, "stop_market", p.get("entryPrice"), be=True)).pack(side="left")
+        L(ac, "Close", DIM, (UI, 8)).pack(side="left", padx=(0, 3))
+        for fr in (0.25, 0.5, 0.75):
+            B(ac, f"{int(fr*100)}%", lambda p=p, fr=fr: ask_close(p, fr)).pack(side="left", padx=(0, 3))
+        B(ac, "100%", lambda p=p: ask_close(p, 1.0), "white", "#7a2230", RED).pack(side="left", padx=(0, 6))
+        B(ac, "Stop→Entry", lambda p=p: ask_set(p, "stop_market", p.get("entryPrice"), be=True)).pack(side="left")
         rows["pos"][p["positionId"]] = dict(card=card, u=u, info=info, slb=slb, tpb=tpb)
     if not D["ords"]: L(ordf, "No working orders", DIM, pady=8).pack(fill="x")
     for o in D["ords"]:
@@ -222,7 +224,7 @@ def build():
         L(r, f"{qty(o.get('quantity'))} @ {fpx(o.get('price') or o.get('triggerPrice'))}", SUB, (MONO, 8)).pack(side="right", padx=6)
 def ask_close(p, frac):
     q = q_str(abs(n(p["quantity"])) * frac, p["asset"]); m = mark(p)
-    confirm("Close All" if frac >= 1 else "Close 50%", [f"{p.get('base')} {p['positionSide'].upper()}", f"MARKET {exit_side(p).upper()} {q} (reduce-only)",
+    confirm(f"Close {int(frac*100)}%", [f"{p.get('base')} {p['positionSide'].upper()}", f"MARKET {exit_side(p).upper()} {q} (reduce-only)",
             f"≈ price {fpx(m)}  ·  est P&L {upnl(p)*frac:+,.2f}"], lambda: close_part(p, frac))
 def ask_set(p, kind, val, be=False):
     try: ps = p_str(n(val, -1), p["asset"])
