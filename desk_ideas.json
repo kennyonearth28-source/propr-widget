@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-10-29T14:18:57.238708+00:00",
-  "updated_et": "2026-10-29 10:18 AM ET",
+  "updated_at": "2026-10-29T14:34:07.382748+00:00",
+  "updated_et": "2026-10-29 10:34 AM ET",
   "idea": {
     "id": "sol-long-1029a",
     "coin": "SOL",
@@ -17,8 +17,18 @@
     "note": "Jules: sweep of the 100.02 lows then reclaim",
     "size50": 166.6667,
     "size100": 333.3333,
-    "status": "watching"
+    "status": "order working",
+    "taken": null,
+    "filled": null,
+    "working": {
+      "account": "#vJ9t Atlas",
+      "qty": 90.9,
+      "price": 99.5,
+      "side": "buy",
+      "status": "open"
+    }
   },
+  "taken": [],
   "ideas": [
     {
       "id": "sol-long-1029a",
@@ -36,7 +46,16 @@
       "note": "Jules: sweep of the 100.02 lows then reclaim",
       "size50": 166.6667,
       "size100": 333.3333,
-      "status": "watching"
+      "status": "order working",
+      "taken": null,
+      "filled": null,
+      "working": {
+        "account": "#vJ9t Atlas",
+        "qty": 90.9,
+        "price": 99.5,
+        "side": "buy",
+        "status": "open"
+      }
     },
     {
       "id": "sol-short-1029a",
@@ -54,7 +73,19 @@
       "note": "Jules: poke into 100.87-101.00 then turn down",
       "size50": 125.0,
       "size100": 250.0,
-      "status": "watching"
+      "status": "filled",
+      "taken": null,
+      "filled": {
+        "account": "Kenny",
+        "size": 320.43,
+        "entry": 100.812652,
+        "pnl": 0.0,
+        "ts": "2026-10-29T14:21:03.086Z",
+        "closed": true,
+        "has_stop": null,
+        "stop": null
+      },
+      "working": null
     }
   ]
 }

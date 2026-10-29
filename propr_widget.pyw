@@ -1,10 +1,20 @@
 # Propr Live - mini corner terminal. Only REDUCE-ONLY orders on existing positions + cancels. Never opens positions.
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 import ctypes, sys, json, os, threading, time, urllib.request, webbrowser, datetime, math, tkinter as tk, tkinter.font as tkf
 HERE = os.path.dirname(os.path.abspath(__file__))
 try: C = json.load(open(os.path.join(HERE, "config.json")))
 except Exception: C = {}
-KEY = C.get("api_key", ""); ACC = C.get("account", "urn:prp-account:qEkueeCybEma")
+KEY = C.get("api_key", ""); ACC = C.get("account", "urn:prp-account:Ucp91RVmvJ9t")
+# Both Propr accounts (Atlas #vJ9t + Kenny). Same API key reads both.
+_ACCS = C.get("accounts") or [
+    {"id": "urn:prp-account:Ucp91RVmvJ9t", "label": "#vJ9t"},
+    {"id": "urn:prp-account:WmyD4P6px6YP", "label": "Kenny"},
+]
+ACCS = []
+for a in _ACCS:
+    if isinstance(a, str): ACCS.append({"id": a if a.startswith("urn:") else "urn:prp-account:"+a, "label": a[-6:]})
+    else: ACCS.append({"id": a.get("id") if str(a.get("id","")).startswith("urn:") else "urn:prp-account:"+str(a.get("id")), "label": a.get("label") or str(a.get("id"))[-6:]})
+if ACC and not any(x["id"] == ACC for x in ACCS): ACCS.insert(0, {"id": ACC, "label": ACC[-6:]})
 FAIL = float(C.get("fail_line", 9700)); TARGET = float(C.get("profit_target", 10900)); TERM = C.get("terminal_url", "https://app.propr.xyz")
 IDEAS_URL = C.get("ideas_url", "https://raw.githubusercontent.com/kennyonearth28-source/propr-widget/main/desk_ideas.json")
 IDEAS_FILE = os.path.join(HERE, "desk_ideas.json")
@@ -29,6 +39,13 @@ def http(url, body=None, key=True):
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code}: {e.read().decode()[:160]}")
 def get(p): return http(BASE + p)
+def get_acc(aid, p): return http(API + "/accounts/" + aid + p)
+def post_acc(aid, orders):
+    for o in orders:
+        if o.get("reduceOnly") is not True or not o.get("positionId"): raise RuntimeError("blocked: not reduce-only")
+        o["accountId"] = aid
+    return http(API + "/accounts/" + aid + "/orders", {"orderGroupId": ulid(), "orders": orders})
+def cancel_acc(aid, oid): return http(API + f"/accounts/{aid}/orders/{oid}/cancel", {})
 def n(x, d=0.0):
     try: return float(x)
     except Exception: return d
@@ -57,13 +74,26 @@ def day_start(eq):
     return n(s.get("equity"), eq)
 
 # ---------------- data threads ----------------
-D = {"ok": None, "t": 0, "err": "", "mids": {}, "mt": 0, "a": None, "pos": [], "ords": [], "idea": None, "ideas_t": 0, "ideas_err": ""}
+D = {"ok": None, "t": 0, "err": "", "mids": {}, "mt": 0, "a": None, "pos": [], "ords": [], "books": {},
+     "idea": None, "taken": [], "ideas_t": 0, "ideas_err": ""}
 def propr_loop():
     while True:
         try:
-            a = get(""); pos = [p for p in get("/positions?status=open").get("data", []) if n(p.get("quantity"))]
-            ords = get("/orders?status=open").get("data", []) + get("/orders?status=pending").get("data", [])
-            D.update(a=a, pos=pos, ords=ords, t=time.time(), ok=True, err="")
+            books = {}; all_pos = []; all_ords = []; primary = None
+            for meta in ACCS:
+                aid = meta["id"]; lab = meta["label"]
+                a = get_acc(aid, "")
+                pos = [p for p in get_acc(aid, "/positions?status=open").get("data", []) if n(p.get("quantity"))]
+                ords = get_acc(aid, "/orders?status=open").get("data", []) + get_acc(aid, "/orders?status=pending").get("data", [])
+                for p in pos:
+                    p["_acct"] = aid; p["_label"] = lab
+                    p["base"] = p.get("base") or (p.get("asset") or "").split(":")[-1]
+                for o in ords:
+                    o["_acct"] = aid; o["_label"] = lab
+                books[aid] = {"a": a, "pos": pos, "ords": ords, "label": lab}
+                all_pos.extend(pos); all_ords.extend(ords)
+                if primary is None: primary = a
+            D.update(a=primary, pos=all_pos, ords=all_ords, books=books, t=time.time(), ok=True, err="")
         except Exception as e: D.update(ok=False, err=str(e)[:80])
         time.sleep(4)
 def price_loop():
@@ -139,22 +169,48 @@ def ideas_loop():
             raw = _load_ideas_payload() or {}
             ideas = raw.get("ideas") or ([raw["idea"]] if raw.get("idea") else [])
             ideas = [i for i in ideas if isinstance(i, dict) and i.get("entry") is not None]
-            primary = None
+            rows = []; taken = []
             for i in ideas:
                 iid = i.get("id") or f"{i.get('coin')}-{i.get('side')}-{i.get('entry')}"
                 st = local_st.setdefault(iid, {"armed": False, "fired": False, "added": time.time() * 1000})
-                # honor remote READY/armed if desk already fired
-                rs = (i.get("status") or "").upper()
-                if rs == "READY": st["fired"] = True
-                elif rs == "ARMED" and not st.get("fired"): st["armed"] = True
+                rs = (i.get("status") or "")
+                rsu = rs.upper()
+                if rsu == "TAKEN" or i.get("taken"):
+                    row = dict(i); row["status"] = "TAKEN"
+                    if not row.get("taken") and isinstance(raw.get("taken"), list):
+                        for trow in raw["taken"]:
+                            if trow.get("id") == iid: row["taken"] = trow.get("taken") or trow; break
+                    taken.append(row); rows.append(row); continue
+                if rsu == "FILLED" or i.get("filled"):
+                    row = dict(i); row["status"] = "filled"; rows.append(row); continue
+                if rsu == "EXPIRED":
+                    row = dict(i); row["status"] = "expired"; rows.append(row); continue
+                if rsu == "READY": st["fired"] = True
+                elif rsu in ("ARMED",) and not st.get("fired"): st["armed"] = True
+                elif rsu == "ORDER WORKING":
+                    row = dict(i); row["status"] = "order working"; row["working"] = i.get("working"); rows.append(row); continue
                 _eval_idea(i, st)
                 dist = abs(n(i.get("entry")) - n(i.get("stop"))) or 1e-9
                 row = dict(i)
                 row["status"] = _idea_status(i, st)
                 row["size50"] = round(50 / dist, 4); row["size100"] = round(100 / dist, 4)
-                if primary is None or {"READY": 0, "armed": 1, "watching": 2, "expired": 3}.get(row["status"], 9) < {"READY": 0, "armed": 1, "watching": 2, "expired": 3}.get(primary.get("status"), 9):
-                    primary = row
-            D.update(idea=primary, ideas_t=time.time(), ideas_err="")
+                rows.append(row)
+            # Prefer desk primary if live; else best live setup
+            live = [r for r in rows if r.get("status") not in ("TAKEN", "filled", "expired")]
+            rank = {"READY": 0, "armed": 1, "order working": 2, "watching": 3}
+            primary = None
+            desk_idea = raw.get("idea") if isinstance(raw.get("idea"), dict) else None
+            if desk_idea and desk_idea.get("status") not in ("TAKEN", "filled", "expired"):
+                primary = desk_idea
+            elif live:
+                primary = sorted(live, key=lambda x: rank.get(x.get("status"), 9))[0]
+            if isinstance(raw.get("taken"), list) and raw["taken"]:
+                taken = []
+                for tr in raw["taken"]:
+                    if isinstance(tr, dict):
+                        if tr.get("taken"): taken.append(tr)
+                        elif tr.get("status") == "TAKEN": taken.append(tr)
+            D.update(idea=primary, taken=taken, ideas_t=time.time(), ideas_err="")
         except Exception as e:
             D["ideas_err"] = str(e)[:60]
         time.sleep(10)
@@ -167,18 +223,20 @@ def upnl(p):
 # ---------------- order actions (reduce-only only) ----------------
 def exit_side(p): return "sell" if (p.get("positionSide") or "").lower() == "long" else "buy"
 def base_order(p, **kw):
-    o = {"accountId": ACC, "exchange": "hyperliquid", "productType": "perp", "asset": p["asset"], "base": p.get("base") or p["asset"],
+    aid = p.get("_acct") or ACC
+    o = {"accountId": aid, "exchange": "hyperliquid", "productType": "perp", "asset": p["asset"], "base": p.get("base") or p["asset"],
          "quote": "USDC", "positionId": p["positionId"], "positionSide": p["positionSide"], "intentId": ulid(),
          "side": exit_side(p), "reduceOnly": True, "closePosition": False}
     o.update(kw); return o
 def post(orders):
     for o in orders:   # hard guard: never open
         if o.get("reduceOnly") is not True or not o.get("positionId"): raise RuntimeError("blocked: not reduce-only")
-    return http(BASE + "/orders", {"orderGroupId": ulid(), "orders": orders})
-def cancel(oid): return http(BASE + f"/orders/{oid}/cancel", {})
+    aid = orders[0].get("accountId") or ACC
+    return post_acc(aid, orders)
+def cancel(oid, aid=None): return cancel_acc(aid or ACC, oid)
 def brackets(p, kind):
-    side = (p.get("positionSide") or "").lower()
-    return [o for o in D["ords"] if o.get("type") == kind and o.get("reduceOnly") and
+    side = (p.get("positionSide") or "").lower(); aid = p.get("_acct")
+    return [o for o in D["ords"] if o.get("type") == kind and o.get("reduceOnly") and (not aid or o.get("_acct") == aid) and
             (o.get("positionId") == p["positionId"] or (not o.get("positionId") and o.get("asset") == p["asset"] and (o.get("positionSide") or "").lower() == side))]
 def close_part(p, frac):
     q = q_str(abs(n(p["quantity"])) * frac, p["asset"])
@@ -189,13 +247,14 @@ def replace(p, kind, price):
     post([base_order(p, type=kind, quantity=q_str(n(p["quantity"]), p["asset"]), triggerPrice=ps, timeInForce="GTC")])
     for _ in range(12):
         time.sleep(0.5)
-        pend = [o for o in get("/orders?status=pending").get("data", []) if o.get("type") == kind and o["orderId"] not in old
+        aid = p.get("_acct") or ACC
+        pend = [o for o in get_acc(aid, "/orders?status=pending").get("data", []) if o.get("type") == kind and o["orderId"] not in old
                 and abs(n(o.get("triggerPrice")) - float(ps)) <= float(ps) * 1e-6 + 1e-12]
         if pend: break
     else: return f"New {'stop' if kind=='stop_market' else 'TP'} {ps} not confirmed - old kept"
     errs = 0
     for oid in old:
-        try: cancel(oid)
+        try: cancel(oid, p.get("_acct") or ACC)
         except Exception: errs += 1
     return f"{'Stop' if kind=='stop_market' else 'TP'} set {ps}" + (f" ({errs} old not cancelled)" if errs else "")
 
@@ -354,8 +413,9 @@ for w in hdr.winfo_children() + [hdr]:
 # equity card
 ec = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=CARD); ec.pack(fill="x", padx=8, pady=4)
 r1 = tk.Frame(ec, bg=CARD); r1.pack(fill="x", padx=12, pady=(10, 0))
-L(r1, "ACCOUNT EQUITY", SUB, F(UI, 8, "bold")).pack(side="left"); L(r1, "qEkueeCybEma", DIM, F(MONO, 8)).pack(side="right")
+L(r1, "ACCOUNT EQUITY", SUB, F(UI, 8, "bold")).pack(side="left"); acclab = L(r1, " + ".join(a["label"] for a in ACCS), DIM, F(MONO, 8)); acclab.pack(side="right")
 eql = L(ec, "—", TXT, F(MONO, 24, "bold")); eql.pack(anchor="w", padx=10)
+eq2 = L(ec, "", SUB, F(MONO, 8), justify="left"); eq2.pack(anchor="w", padx=12)
 r2 = tk.Frame(ec, bg=CARD); r2.pack(fill="x", padx=12)
 pnll = L(r2, "", GRN, F(MONO, 10, "bold")); pnll.pack(side="left"); upl = L(r2, "", GRN, F(MONO, 9)); upl.pack(side="right")
 bar = tk.Canvas(ec, height=8, bg=CARD, highlightthickness=0); bar.pack(fill="x", padx=12, pady=(8, 2))
@@ -472,6 +532,7 @@ def build():
         t = tk.Frame(inn, bg=CARD); t.pack(fill="x")
         L(t, p.get("base") or p["asset"], font=F(UI, 11, "bold")).pack(side="left")
         L(t, f" {side.upper()} {p.get('leverage','')}x ", sc, F(UI, 8, "bold"), CARD2).pack(side="left", padx=6)
+        if p.get("_label"): L(t, f" {p['_label']} ", DIM, F(UI, 7, "bold"), CARD2).pack(side="left")
         pxl = L(t, "", TXT, F(MONO, 10, "bold")); pxl.pack(side="left")
         u = L(t, "", font=F(MONO, 12, "bold")); u.pack(side="right")
         info = L(inn, "", SUB, F(MONO, 8), justify="left", wraplength=WW() - 50); info.pack(anchor="w", pady=(2, 3))
@@ -501,6 +562,7 @@ def build():
         r = tk.Frame(ordf, bg=CARD); r.pack(fill="x", padx=8, pady=2)
         s = (o.get("side") or "").lower(); typ = {"limit": "LIMIT", "stop_market": "STOP", "take_profit_market": "TP", "market": "MKT"}.get(o.get("type"), (o.get("type") or "").upper())
         L(r, o.get("base") or o.get("asset"), font=F(UI, 9, "bold"), anchor="w").pack(side="left")
+        if o.get("_label"): L(r, o["_label"], DIM, F(UI, 7), anchor="w").pack(side="left", padx=(4, 0))
         L(r, f"{typ} {s.upper()}", GRN if s == "buy" else RED, F(UI, 8, "bold"), anchor="w").pack(side="left", padx=6)
         B(r, "Cancel", lambda o=o: ask_cancel(o), SUB, CARD2, "#5a1a24").pack(side="right")
         r2 = tk.Frame(ordf, bg=CARD); r2.pack(fill="x", padx=8, pady=(0, 3))   # v3.4: price on its own line, wraps instead of clipping
@@ -523,24 +585,47 @@ def ask_set(p, kind, val, be=False):
             f"NEW {'STOP' if kind=='stop_market' else 'TP'} {exit_side(p).upper()} @ {ps} (reduce-only)", f"then cancel old: {old}", f"mark now {fpx(m)}"] + ([warn] if warn else []),
             lambda: replace(p, kind, ps), danger=bool(warn))
 def ask_cancel(o):
-    confirm("Cancel order", [f"{o.get('base') or o.get('asset')} {o.get('type')} {o.get('side')}", f"qty {qty(o.get('quantity'))} @ {fpx(o.get('price') or o.get('triggerPrice'))}",
-            ("⚠ this is a protective order" if o.get("reduceOnly") else "")], lambda: (cancel(o["orderId"]), "Order cancelled")[1])
+    confirm("Cancel order", [f"{o.get('_label') or ''} {o.get('base') or o.get('asset')} {o.get('type')} {o.get('side')}", f"qty {qty(o.get('quantity'))} @ {fpx(o.get('price') or o.get('triggerPrice'))}",
+            ("⚠ this is a protective order" if o.get("reduceOnly") else "")], lambda: (cancel(o["orderId"], o.get("_acct") or ACC), "Order cancelled")[1])
 
 def paint_idea():
-    idea = D.get("idea")
+    idea = D.get("idea"); taken = D.get("taken") or []
     try:
-        if not idea or idea.get("status") == "expired":
-            idea_st.config(text="", fg=DIM, bg=CARD); idea_title.config(text="no trades right now", fg=DIM)
-            idea_nums.config(text=""); idea_tps.config(text="")
-            ideaf.config(highlightbackground=CARD, bg=CARD)
+        # Slim "you're in" for the most recent taken desk idea
+        taken_line = ""
+        warn_stop = False
+        if taken:
+            tr = taken[0]; hit = tr.get("taken") or {}
+            coin = (hit.get("coin") or tr.get("coin") or "").split(":")[-1]
+            side = (hit.get("side") or tr.get("side") or "").lower()
+            sz = hit.get("size"); en = hit.get("entry"); pnl = hit.get("pnl")
+            has_stop = hit.get("has_stop"); stop = hit.get("stop")
+            if has_stop is False or stop is None:
+                warn_stop = True; stop_txt = "stop: NONE!"
+            else:
+                stop_txt = f"stop {fpx(stop)}"
+            taken_line = f"You're in: {coin} {side} {qty(sz)} @ {fpx(en)}  P/L {n(pnl):+,.2f}  {stop_txt}"
+        if not idea or idea.get("status") in ("expired", "TAKEN", "filled"):
+            idea_st.config(text=("TAKEN" if taken else ""), fg=("white" if taken else DIM), bg=(RED if warn_stop else (CARD2 if taken else CARD)))
+            idea_title.config(text=taken_line or "no setups right now", fg=(RED if warn_stop else (TXT if taken_line else DIM)))
+            idea_nums.config(text=("⚠ no stop on that fill — set one" if warn_stop else ""), fg=RED)
+            idea_tps.config(text="")
+            ideaf.config(highlightbackground=(RED if warn_stop else CARD), bg=CARD)
         else:
             st = idea.get("status") or "watching"
             ready = st == "READY"
-            idea_st.config(text=st, fg=("white" if ready else (AMB if st == "armed" else DIM)), bg=("#0ecb81" if ready else CARD))
-            idea_title.config(text=f"{idea.get('coin')} {str(idea.get('side','')).upper()}" + ("  ·  put it in now" if ready else ""), fg=TXT)
-            idea_nums.config(text=f"Entry {fpx(idea.get('entry'))}   Stop {fpx(idea.get('stop'))}   Size $50 {qty(idea.get('size50'))} / $100 {qty(idea.get('size100'))}")
-            idea_tps.config(text=f"Half {fpx(idea.get('tp1'))} → stop to entry · Rest {fpx(idea.get('tp2'))}")
-            ideaf.config(highlightbackground=(GRN if ready else CARD), bg=CARD)
+            idea_st.config(text=st, fg=("white" if ready else (AMB if st in ("armed", "order working") else DIM)),
+                           bg=("#0ecb81" if ready else CARD))
+            title = f"{idea.get('coin')} {str(idea.get('side','')).upper()}"
+            if ready: title += "  ·  put it in now"
+            elif st == "order working": title += "  ·  order working"
+            idea_title.config(text=title, fg=TXT)
+            idea_nums.config(text=f"Entry {fpx(idea.get('entry'))}   Stop {fpx(idea.get('stop'))}   Size $50 {qty(idea.get('size50'))} / $100 {qty(idea.get('size100'))}", fg=SUB)
+            extra = f"Half {fpx(idea.get('tp1'))} → stop to entry · Rest {fpx(idea.get('tp2'))}"
+            if taken_line:
+                idea_nums.config(text=taken_line + ("  ⚠ NO STOP" if warn_stop else ""), fg=(RED if warn_stop else SUB))
+            idea_tps.config(text=extra, fg=DIM)
+            ideaf.config(highlightbackground=(GRN if ready else (RED if warn_stop else CARD)), bg=CARD)
     except Exception:
         pass
 
@@ -555,9 +640,22 @@ def tick():
             sig = (tuple(p["positionId"] for p in D["pos"]), tuple((o["orderId"], o.get("triggerPrice"), o.get("price")) for o in D["ords"]))
             if sig != rows["sig"] and not busy["on"] and not (root.focus_get().__class__ is tk.Entry):
                 rows["sig"] = sig; build(); root.update_idletasks(); place_win()
-            lu = sum(upnl(p) for p in D["pos"]); eq = n(a.get("marginBalance")) - n(a.get("totalUnrealizedPnl")) + lu
-            base = day_start(n(a.get("marginBalance"))); pnl = eq - base; pct = pnl / base * 100 if base else 0; room = eq - FAIL
+            # Combined view: primary = Atlas (#vJ9t) if present, else first book
+            books = D.get("books") or {}
+            parts = []
+            eq = None; lu = sum(upnl(p) for p in D["pos"])
+            for meta in ACCS:
+                b = books.get(meta["id"])
+                if not b or not b.get("a"): continue
+                aa = b["a"]; blu = sum(upnl(p) for p in b["pos"])
+                beq = n(aa.get("marginBalance")) - n(aa.get("totalUnrealizedPnl")) + blu
+                parts.append(f"{meta['label']} ${beq:,.0f}")
+                if eq is None or meta["id"].endswith("Ucp91RVmvJ9t"): eq = beq  # prefer Atlas for fail bar
+            if eq is None:
+                eq = n(a.get("marginBalance")) - n(a.get("totalUnrealizedPnl")) + lu
+            base = day_start(eq); pnl = eq - base; pct = pnl / base * 100 if base else 0; room = eq - FAIL
             mini_tick(eq, lu)
+            eq2.config(text=" · ".join(parts))
             eql.config(text=f"${eq:,.2f}", fg=RED if room <= 100 else TXT)
             pnll.config(text=f"{'▲' if pnl >= 0 else '▼'} {pnl:+,.2f} ({pct:+.2f}%) today", fg=GRN if pnl >= 0 else RED)
             upl.config(text=f"uPnL {lu:+,.2f}", fg=GRN if lu >= 0 else RED)
