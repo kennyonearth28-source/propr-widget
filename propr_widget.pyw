@@ -1,11 +1,13 @@
 # Propr Live - mini corner terminal. Only REDUCE-ONLY orders on existing positions + cancels. Never opens positions.
-VERSION = "3.4.2"
+VERSION = "3.5.0"
 import ctypes, sys, json, os, threading, time, urllib.request, webbrowser, datetime, math, tkinter as tk, tkinter.font as tkf
 HERE = os.path.dirname(os.path.abspath(__file__))
 try: C = json.load(open(os.path.join(HERE, "config.json")))
 except Exception: C = {}
 KEY = C.get("api_key", ""); ACC = C.get("account", "urn:prp-account:qEkueeCybEma")
 FAIL = float(C.get("fail_line", 9700)); TARGET = float(C.get("profit_target", 10900)); TERM = C.get("terminal_url", "https://app.propr.xyz")
+IDEAS_URL = C.get("ideas_url", "https://raw.githubusercontent.com/kennyonearth28-source/propr-widget/main/desk_ideas.json")
+IDEAS_FILE = os.path.join(HERE, "desk_ideas.json")
 API = "https://api.propr.xyz/v1"; BASE = API + "/accounts/" + ACC; STATE = os.path.join(HERE, "day_start.json")
 HL = "https://api.hyperliquid.xyz/info"
 W = 380
@@ -55,7 +57,7 @@ def day_start(eq):
     return n(s.get("equity"), eq)
 
 # ---------------- data threads ----------------
-D = {"ok": None, "t": 0, "err": "", "mids": {}, "mt": 0, "a": None, "pos": [], "ords": []}
+D = {"ok": None, "t": 0, "err": "", "mids": {}, "mt": 0, "a": None, "pos": [], "ords": [], "idea": None, "ideas_t": 0, "ideas_err": ""}
 def propr_loop():
     while True:
         try:
@@ -76,6 +78,87 @@ def price_loop():
             D.update(mids=m, mt=time.time())
         except Exception: pass
         time.sleep(1)
+
+def _load_ideas_payload():
+    """Local file first, then public ideas_url (no API key)."""
+    for path in (IDEAS_FILE,):
+        try:
+            return json.load(open(path, encoding="utf-8"))
+        except Exception:
+            pass
+    if IDEAS_URL:
+        try:
+            url = IDEAS_URL + ("&" if "?" in IDEAS_URL else "?") + "t=" + str(int(time.time()))
+            return http(url, key=False)
+        except Exception as e:
+            D["ideas_err"] = str(e)[:60]
+    return {}
+
+def _idea_status(idea, st):
+    """watching / armed / READY / expired — same rules as the free box watcher."""
+    try:
+        if idea.get("expires") and datetime.datetime.now(datetime.timezone.utc) > datetime.datetime.fromisoformat(idea["expires"].replace("Z", "+00:00")):
+            return "expired"
+    except Exception:
+        pass
+    if st.get("fired"): return "READY"
+    if st.get("armed"): return "armed"
+    return "watching"
+
+def _eval_idea(idea, st):
+    """Arm on sweep, fire on confirm close. Mutates st. Uses public HL candles only."""
+    if st.get("fired"): return
+    try:
+        if idea.get("expires") and datetime.datetime.now(datetime.timezone.utc) > datetime.datetime.fromisoformat(idea["expires"].replace("Z", "+00:00")):
+            return
+    except Exception:
+        pass
+    since = int(st.get("added") or (time.time() * 1000 - 3600_000))
+    body = {"type": "candleSnapshot", "req": {"coin": idea["coin"], "interval": "5m", "startTime": since - 300_000, "endTime": int(time.time() * 1000)}}
+    try:
+        cs = http(HL, body, key=False)
+    except Exception:
+        return
+    if not isinstance(cs, list) or len(cs) < 2: return
+    closed = cs[:-1]
+    for c in closed:
+        if idea.get("arm") == "below" and n(c.get("l")) < n(idea.get("arm_level")): st["armed"] = True
+        if idea.get("arm") == "above" and n(c.get("h")) > n(idea.get("arm_level")): st["armed"] = True
+        if idea.get("arm") == "none": st["armed"] = True
+    if not st.get("armed"): return
+    cl = n(closed[-1].get("c"))
+    side = (idea.get("side") or "").lower()
+    if side == "long" and cl > n(idea.get("confirm_close_above", idea.get("entry"))) and cl < n(idea.get("tp1")): st["fired"] = True
+    if side == "short" and cl < n(idea.get("confirm_close_below", idea.get("entry"))) and cl > n(idea.get("tp1")): st["fired"] = True
+
+def ideas_loop():
+    """Refresh desk idea every ~10s. Never uses Propr key."""
+    local_st = {}
+    while True:
+        try:
+            raw = _load_ideas_payload() or {}
+            ideas = raw.get("ideas") or ([raw["idea"]] if raw.get("idea") else [])
+            ideas = [i for i in ideas if isinstance(i, dict) and i.get("entry") is not None]
+            primary = None
+            for i in ideas:
+                iid = i.get("id") or f"{i.get('coin')}-{i.get('side')}-{i.get('entry')}"
+                st = local_st.setdefault(iid, {"armed": False, "fired": False, "added": time.time() * 1000})
+                # honor remote READY/armed if desk already fired
+                rs = (i.get("status") or "").upper()
+                if rs == "READY": st["fired"] = True
+                elif rs == "ARMED" and not st.get("fired"): st["armed"] = True
+                _eval_idea(i, st)
+                dist = abs(n(i.get("entry")) - n(i.get("stop"))) or 1e-9
+                row = dict(i)
+                row["status"] = _idea_status(i, st)
+                row["size50"] = round(50 / dist, 4); row["size100"] = round(100 / dist, 4)
+                if primary is None or {"READY": 0, "armed": 1, "watching": 2, "expired": 3}.get(row["status"], 9) < {"READY": 0, "armed": 1, "watching": 2, "expired": 3}.get(primary.get("status"), 9):
+                    primary = row
+            D.update(idea=primary, ideas_t=time.time(), ideas_err="")
+        except Exception as e:
+            D["ideas_err"] = str(e)[:60]
+        time.sleep(10)
+
 def mark(p): return n(D["mids"].get(p.get("asset")), n(p.get("markPrice")))
 def upnl(p):
     sgn = 1 if (p.get("positionSide") or "").lower() == "long" else -1
@@ -279,6 +362,14 @@ bar = tk.Canvas(ec, height=8, bg=CARD, highlightthickness=0); bar.pack(fill="x",
 faill = L(ec, "", SUB, F(UI, 7), justify="left"); faill.pack(anchor="w", padx=12, pady=(0, 2))
 tbar = tk.Canvas(ec, height=8, bg=CARD, highlightthickness=0); tbar.pack(fill="x", padx=12, pady=(4, 2))
 tgl = L(ec, "", SUB, F(UI, 7), justify="left"); tgl.pack(anchor="w", padx=12, pady=(0, 8))
+# v3.5 take-this-trade card (one idea, calm; highlight only when READY)
+ideaf = tk.Frame(root, bg=CARD, highlightthickness=1, highlightbackground=CARD); ideaf.pack(fill="x", padx=8, pady=(0, 4))
+idea_hdr = tk.Frame(ideaf, bg=CARD); idea_hdr.pack(fill="x", padx=10, pady=(8, 0))
+L(idea_hdr, "TAKE THIS TRADE", SUB, F(UI, 8, "bold")).pack(side="left")
+idea_st = L(idea_hdr, "", DIM, F(UI, 8, "bold")); idea_st.pack(side="right")
+idea_title = L(ideaf, "no trades right now", TXT, F(UI, 11, "bold")); idea_title.pack(anchor="w", padx=10, pady=(2, 0))
+idea_nums = L(ideaf, "", SUB, F(MONO, 9), justify="left", wraplength=WW() - 40); idea_nums.pack(anchor="w", padx=10, pady=(2, 0))
+idea_tps = L(ideaf, "", DIM, F(MONO, 8), justify="left", wraplength=WW() - 40); idea_tps.pack(anchor="w", padx=10, pady=(0, 8))
 # v3.4.1 positions/orders live in a scrollable area so the window never runs off-screen
 bodyf = tk.Frame(root, bg=BG); bodyf.pack(fill="x")
 body = tk.Canvas(bodyf, bg=BG, highlightthickness=0, height=200); body.pack(side="left", fill="x", expand=True)
@@ -306,7 +397,7 @@ m_eq = L(minif, "", TXT, F(MONO, 12, "bold"), anchor="w"); m_eq.pack(fill="x", p
 m_up = L(minif, "", SUB, F(MONO, 9), anchor="w"); m_up.pack(fill="x", padx=10)
 m_pos = tk.Frame(minif, bg=CARD); m_pos.pack(fill="x", padx=10, pady=(0, 4))
 FOOT = root.pack_slaves()[-1]
-FULL = [ec, bodyf, emerg, FOOT]
+FULL = [ec, ideaf, bodyf, emerg, FOOT]
 def toggle_mini(e=None, init=False):
     if not init: MINI["on"] = not MINI["on"]
     if MINI["on"]:
@@ -314,7 +405,7 @@ def toggle_mini(e=None, init=False):
         minif.pack(fill="x", padx=8, pady=(0, 8), after=hdr)
     else:
         minif.pack_forget()
-        ec.pack(fill="x", padx=8, pady=4, after=hdr); bodyf.pack(fill="x", after=ec)
+        ec.pack(fill="x", padx=8, pady=4, after=hdr); ideaf.pack(fill="x", padx=8, pady=(0, 4), after=ec); bodyf.pack(fill="x", after=ideaf)
         emerg.pack(fill="x", padx=8, pady=(10, 4), after=bodyf); FOOT.pack(pady=(0, 6), after=emerg)
     root.update_idletasks(); place_win()
     if not init: save_set()
@@ -322,18 +413,26 @@ for w_ in (m_eq, m_up, minif): w_.bind("<Double-Button-1>", toggle_mini)
 eql.bind("<Double-Button-1>", toggle_mini)
 def mini_tick(eq, lu):
     m_eq.config(text=f"${eq:,.2f}"); m_up.config(text=f"uPnL {lu:+,.2f}", fg=GRN if lu >= 0 else RED)
+    idea = D.get("idea"); npos = max(1, len(D["pos"])) + (1 if idea and idea.get("status") != "expired" else 0)
     ws = m_pos.winfo_children()
-    if len(ws) != max(1, len(D["pos"])):
+    if len(ws) != npos:
         for w_ in ws: w_.destroy()
-        ws = [L(m_pos, "", SUB, F(MONO, 9), anchor="w") for _ in range(max(1, len(D["pos"])))]
+        ws = [L(m_pos, "", SUB, F(MONO, 9), anchor="w") for _ in range(npos)]
         for w_ in ws: w_.pack(fill="x"); w_.bind("<Double-Button-1>", toggle_mini)
         root.update_idletasks(); place_win()
-    if not D["pos"]: ws[0].config(text="No open positions", fg=DIM)
-    for w_, p in zip(ws, D["pos"]):
-        u = upnl(p); w_.config(text=f"{p.get('base') or p['asset']} {(p.get('positionSide') or '')[:1].upper()} {fpx(mark(p))}  {u:+,.2f}", fg=GRN if u >= 0 else RED)
+    i = 0
+    if idea and idea.get("status") != "expired":
+        ready = idea.get("status") == "READY"
+        ws[i].config(text=("PUT IN NOW · " if ready else "") + f"{idea.get('coin')} {str(idea.get('side','')).upper()} @ {fpx(idea.get('entry'))}",
+                     fg=("white" if ready else SUB), bg=("#11402c" if ready else CARD))
+        i += 1
+    if not D["pos"]:
+        if i < len(ws): ws[i].config(text="No open positions", fg=DIM, bg=CARD)
+    for w_, p in zip(ws[i:], D["pos"]):
+        u = upnl(p); w_.config(text=f"{p.get('base') or p['asset']} {(p.get('positionSide') or '')[:1].upper()} {fpx(mark(p))}  {u:+,.2f}", fg=GRN if u >= 0 else RED, bg=CARD)
 # v3.4 drag-to-resize: right edge = width, bottom edge = height, corner grip = both
 def relayout():
-    w = WW(); tl.config(wraplength=w - 30); faill.config(wraplength=w - 40); tgl.config(wraplength=w - 40)
+    w = WW(); tl.config(wraplength=w - 30); faill.config(wraplength=w - 40); tgl.config(wraplength=w - 40); idea_nums.config(wraplength=w - 40); idea_tps.config(wraplength=w - 40)
     rows["sig"] = None   # rebuild rows so they reflow to the new width
     for r in rows["ord"].values(): r["lab"].config(wraplength=w - 60)
     root.update_idletasks(); place_win()
@@ -427,6 +526,24 @@ def ask_cancel(o):
     confirm("Cancel order", [f"{o.get('base') or o.get('asset')} {o.get('type')} {o.get('side')}", f"qty {qty(o.get('quantity'))} @ {fpx(o.get('price') or o.get('triggerPrice'))}",
             ("⚠ this is a protective order" if o.get("reduceOnly") else "")], lambda: (cancel(o["orderId"]), "Order cancelled")[1])
 
+def paint_idea():
+    idea = D.get("idea")
+    try:
+        if not idea or idea.get("status") == "expired":
+            idea_st.config(text="", fg=DIM, bg=CARD); idea_title.config(text="no trades right now", fg=DIM)
+            idea_nums.config(text=""); idea_tps.config(text="")
+            ideaf.config(highlightbackground=CARD, bg=CARD)
+        else:
+            st = idea.get("status") or "watching"
+            ready = st == "READY"
+            idea_st.config(text=st, fg=("white" if ready else (AMB if st == "armed" else DIM)), bg=("#0ecb81" if ready else CARD))
+            idea_title.config(text=f"{idea.get('coin')} {str(idea.get('side','')).upper()}" + ("  ·  put it in now" if ready else ""), fg=TXT)
+            idea_nums.config(text=f"Entry {fpx(idea.get('entry'))}   Stop {fpx(idea.get('stop'))}   Size $50 {qty(idea.get('size50'))} / $100 {qty(idea.get('size100'))}")
+            idea_tps.config(text=f"Half {fpx(idea.get('tp1'))} → stop to entry · Rest {fpx(idea.get('tp2'))}")
+            ideaf.config(highlightbackground=(GRN if ready else CARD), bg=CARD)
+    except Exception:
+        pass
+
 def tick():
     try:
         now = time.time(); fresh = D["mt"] and now - D["mt"] < 10; pl = D["ok"] and now - D["t"] < 20
@@ -463,6 +580,7 @@ def tick():
                 r["card"].config(highlightbackground=CARD if sl else RED)
             for r in rows["ord"].values():
                 mp = n(D["mids"].get(r["asset"])); r["px"].config(text=r["txt"] + (f"   ·   now ${fpx(mp)}" if mp else ""))
+        paint_idea()
         if not hasattr(root, "_d") and not hasattr(root, "_r"): place_win(grow=False)   # v3.4.2: keep on-screen, never enlarge   # keep fitted + on-screen (also after monitor/taskbar changes)
     except Exception: pass
     root.after(500, tick)
@@ -476,5 +594,5 @@ def keep_top():
             top_noactivate(root)  # SWP_NOACTIVATE: never steals focus
     except Exception: pass
     root.after(3000, keep_top)
-for f in (propr_loop, price_loop): threading.Thread(target=f, daemon=True).start()
+for f in (propr_loop, price_loop, ideas_loop): threading.Thread(target=f, daemon=True).start()
 tick(); keep_top(); root.mainloop()

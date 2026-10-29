@@ -1,0 +1,60 @@
+{
+  "updated_at": "2026-10-29T14:18:57.238708+00:00",
+  "updated_et": "2026-10-29 10:18 AM ET",
+  "idea": {
+    "id": "sol-long-1029a",
+    "coin": "SOL",
+    "side": "long",
+    "arm": "below",
+    "arm_level": 100.02,
+    "confirm_close_above": 100.1,
+    "confirm_close_below": null,
+    "entry": 100.1,
+    "stop": 99.8,
+    "tp1": 100.4,
+    "tp2": 100.7,
+    "expires": "2026-10-29T20:00:00Z",
+    "note": "Jules: sweep of the 100.02 lows then reclaim",
+    "size50": 166.6667,
+    "size100": 333.3333,
+    "status": "watching"
+  },
+  "ideas": [
+    {
+      "id": "sol-long-1029a",
+      "coin": "SOL",
+      "side": "long",
+      "arm": "below",
+      "arm_level": 100.02,
+      "confirm_close_above": 100.1,
+      "confirm_close_below": null,
+      "entry": 100.1,
+      "stop": 99.8,
+      "tp1": 100.4,
+      "tp2": 100.7,
+      "expires": "2026-10-29T20:00:00Z",
+      "note": "Jules: sweep of the 100.02 lows then reclaim",
+      "size50": 166.6667,
+      "size100": 333.3333,
+      "status": "watching"
+    },
+    {
+      "id": "sol-short-1029a",
+      "coin": "SOL",
+      "side": "short",
+      "arm": "above",
+      "arm_level": 100.87,
+      "confirm_close_above": null,
+      "confirm_close_below": 100.95,
+      "entry": 100.95,
+      "stop": 101.35,
+      "tp1": 100.55,
+      "tp2": 100.15,
+      "expires": "2026-10-29T20:00:00Z",
+      "note": "Jules: poke into 100.87-101.00 then turn down",
+      "size50": 125.0,
+      "size100": 250.0,
+      "status": "watching"
+    }
+  ]
+}
